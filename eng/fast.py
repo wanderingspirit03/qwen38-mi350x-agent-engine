@@ -76,19 +76,16 @@ class Fast:
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.lin = []
         for i, L in enumerate(w.layers):
-            d = {"gate_up": Linear(L["gate_up"]), "down": Linear(L["down"])}
-            if IS_ATTN[i]:
-                d["qkv"], d["o"] = Linear(L["qkv"]), Linear(L["o"])
-            else:
-                d["in_proj"], d["out"] = Linear(L["in_proj"]), Linear(L["out"])
-            self.lin.append(d)
+            self.lin.append(self._layer_lin(L, IS_ATTN[i]))
         M = w.mtp
-        self.mlin = {k: Linear(M[k]) for k in ("fc", "qkv", "o", "gate_up", "down")}
-        self.head = Linear(w.lm_head)
+        self.mlin = self._layer_lin(M, True)
+        self.mlin["fc"] = Linear(M["fc"])
+        HL = Linear if W4_HEAD else Bf16Linear
+        self.head = HL(w.lm_head)
         # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head
         dv = np.load(os.path.join(os.path.dirname(__file__), "draft_vocab.npy"))
         self.dvocab = torch.from_numpy(dv.astype(np.int64)).to(dev)
-        self.dhead = Linear(w.lm_head[self.dvocab].contiguous())
+        self.dhead = HL(w.lm_head[self.dvocab].contiguous())
         # GDN per-layer weights stacked for the all-layer commit
         G = [L for i, L in enumerate(w.layers) if not IS_ATTN[i]]
         self.cw = torch.stack([L["conv"] for L in G])

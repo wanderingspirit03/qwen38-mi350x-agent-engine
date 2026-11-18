@@ -59,9 +59,13 @@ class Lin:
             return
         M, K = x.shape
         xq = _QBUF[: M * K].view(M, K)
-        xs = _SBUF[:M]
-        H.quant_fp8(x, xq, xs)
-        torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.ws, out_dtype=torch.bfloat16, out=out)
+        H.quant_fp8(x, xq, _SBUF[:M])
+        self.mm_q(xq, out)
+
+    def mm_q(self, xq, out):
+        """xq: rows already quantized into _QBUF, scales in _SBUF."""
+        torch._scaled_mm(xq, self.wq.t(), scale_a=_SBUF[:xq.shape[0]], scale_b=self.ws, out_dtype=torch.bfloat16,
+                         out=out)
 
 
 class Prefill:
@@ -102,8 +106,13 @@ class Prefill:
     def _mlp(self, L, lin, T):
         H.add_rmsnorm(self.x[:T], self.d[:T], L["post_norm"], self.h[:T])
         lin["gate_up"](self.h[:T], self.gu[:T])
-        H.silu_mul(self.gu[:T], self.act[:T])
-        lin["down"](self.act[:T], self.d[:T])
+        if lin["down"].fp8:
+            aq = _QBUF[: T * INTER].view(T, INTER)
+            H.silu_mul_quant(self.gu[:T], aq, _SBUF[:T])
+            lin["down"].mm_q(aq, self.d[:T])
+        else:
+            H.silu_mul(self.gu[:T], self.act[:T])
+            lin["down"](self.act[:T], self.d[:T])
 
     @torch.inference_mode()
     def chunk(self, ids, p0, st):

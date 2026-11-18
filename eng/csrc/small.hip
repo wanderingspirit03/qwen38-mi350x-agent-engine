@@ -138,7 +138,58 @@ __global__ __launch_bounds__(256) void quant_fp8_kernel(const bf16* __restrict__
   }
 }
 
+// act = silu(gu[:, :I]) * gu[:, I:] (rounded to bf16 as silu_mul does), quantized to fp8 per row like quant_fp8.
+// grid R, block 512; I % 8 == 0, I <= 512 * 8 * 5.
+__global__ __launch_bounds__(512) void silu_mul_quant_kernel(const bf16* __restrict__ gu, int I,
+                                                              __hip_fp8_storage_t* __restrict__ q,
+                                                              float* __restrict__ sc) {
+  __shared__ float red[8];
+  int r = blockIdx.x, nv = I / 8;
+  const bf16* g = gu + (size_t)r * 2 * I;
+  float a[5][8];
+  float m = 0.f;
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int v = threadIdx.x + k * 512;
+    if (v < nv) {
+      uint4 ug = *reinterpret_cast<const uint4*>(g + v * 8), uu = *reinterpret_cast<const uint4*>(g + I + v * 8);
+      const bf16* eg = reinterpret_cast<const bf16*>(&ug);
+      const bf16* eu = reinterpret_cast<const bf16*>(&uu);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        float x = bf(eg[j]);
+        a[k][j] = rbf(rbf(x / (1.f + __expf(-x))) * bf(eu[j]));
+        m = fmaxf(m, fabsf(a[k][j]));
+      }
+    }
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) red[threadIdx.x >> 6] = m;
+  __syncthreads();
+#pragma unroll
+  for (int k = 0; k < 8; k++) m = fmaxf(m, red[k]);
+  float s = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / s;
+  if (threadIdx.x == 0) sc[r] = s;
+  __hip_fp8_storage_t* qr = q + (size_t)r * I;
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int v = threadIdx.x + k * 512;
+    if (v < nv) {
+      uint2 o;
+      __hip_fp8_storage_t* ob = reinterpret_cast<__hip_fp8_storage_t*>(&o);
+#pragma unroll
+      for (int j = 0; j < 8; j++) ob[j] = __hip_cvt_float_to_fp8(a[k][j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+      *reinterpret_cast<uint2*>(qr + v * 8) = o;
+    }
+  }
+}
+
 extern "C" {
+int silu_mul_quant(int R, int I, const void* gu, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(silu_mul_quant_kernel, dim3(R), dim3(512), 0, s, (const bf16*)gu, I, (__hip_fp8_storage_t*)q,
+                     (float*)sc);
+  return (int)hipGetLastError();
+}
 int quant_fp8(int R, int K, const void* x, int xs, void* q, void* sc, hipStream_t s) {
   hipLaunchKernelGGL(quant_fp8_kernel, dim3(R), dim3(256), 0, s, (const bf16*)x, K, xs, (__hip_fp8_storage_t*)q,
                      (float*)sc);

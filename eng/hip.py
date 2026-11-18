@@ -115,3 +115,12 @@ def gdn_conv(proj, hist, cw, aneg, dtb, y, gb):
     T = proj.shape[0]
     _check(lib.gdn_conv(T, p(proj), proj.stride(0), p(hist), p(cw), p(aneg), p(dtb), p(y), p(gb), stream()),
            "gdn_conv")
+
+
+lib.silu_mul_quant.argtypes = [I, I, P, P, P, P]
+
+
+def silu_mul_quant(gu, q, sc):
+    """gu (R, 2I) bf16 contiguous -> q (R, I) fp8 = silu(gate) * up quantized per row, sc (R, 1) fp32."""
+    assert gu.is_contiguous() and q.is_contiguous()
+    _check(lib.silu_mul_quant(gu.shape[0], gu.shape[1] // 2, p(gu), p(q), p(sc), stream()), "silu_mul_quant")
