@@ -11,7 +11,7 @@ from .model import Weights
 from .prefill import CHUNK, Prefill
 
 STOP_IDS = (248046, 248044)
-SPEC_K = int(os.environ.get("ENG_SPEC_K", "4"))
+SPEC_K = int(os.environ.get("ENG_SPEC_K", "8"))
 MAX_LEN = int(os.environ.get("ENG_MAX_LEN", "24576"))
 CACHE_GB = float(os.environ.get("ENG_CACHE_GB", "80"))
 
