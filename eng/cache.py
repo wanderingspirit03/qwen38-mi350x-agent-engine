@@ -59,7 +59,7 @@ class PrefixCache:
         if best_lcp - 1 > c0:
             pts.add(min(best_lcp - 1, n - 1))
         pts.update(range((c0 // self.every + 1) * self.every, n - 1, self.every))
-        return sorted(p for p in pts if p > c0)
+        return sorted(p for p in pts if p > c0 + 256)        # no tiny chunks just for a checkpoint
 
     def restore(self, e, c, work_kv, ssm, conv):
         """Load entry e's state at c into the working buffers."""

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from . import hip as H
 from . import ref_ops as R
 from .kernels.attention import attn_prefill
+from .kernels.gdn_prefill import gdn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
 CHUNK = 4096
@@ -77,8 +78,8 @@ class Prefill:
         self.h = torch.empty(C, HIDDEN, **bf)
         self.d = torch.empty(C, HIDDEN, **bf)
         self.proj = torch.empty(C, PROJ, **bf)
-        self.qk = torch.empty(C, 32, 128, dtype=torch.float32, device=dev)
-        self.vv = torch.empty(C, 48, 128, dtype=torch.float32, device=dev)
+        self.y = torch.empty(C, CONV_DIM, **bf)
+        self.o = torch.empty(C, 48, 128, **bf)
         self.gb = torch.empty(C, 2, 48, dtype=torch.float32, device=dev)
         self.go = torch.empty(C, V_DIM, **bf)
         self.qkv = torch.empty(C, 14336, **bf)
@@ -121,10 +122,13 @@ class Prefill:
             else:
                 proj = self.proj[:T]
                 lin["in_proj"](self.h[:T], proj)
-                H.gdn_prep(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], self.qk[:T], self.vv[:T],
-                           self.gb[:T])
-                o = self.gdn_chunk(self.qk[:T], self.vv[:T], self.gb[:T], st.ssm[gi])
-                H.gated_norm(o, proj, L["gnorm"], self.go[:T])
+                y = self.y[:T]
+                H.gdn_conv(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], y, self.gb[:T])
+                q = y[:, :2048].view(T, 16, 128)
+                k = y[:, 2048:4096].view(T, 16, 128)
+                v = y[:, 4096:].view(T, 48, 128)
+                gdn_prefill(q, k, v, self.gb[:T, 0], self.gb[:T, 1], st.ssm[gi], out=self.o[:T])
+                H.gated_norm(self.o[:T], proj, L["gnorm"], self.go[:T])
                 H.conv_update(self.nrow, proj, st.conv[gi])
                 lin["out"](self.go[:T], self.d[:T])
                 gi += 1

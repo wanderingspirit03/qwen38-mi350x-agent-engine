@@ -14,10 +14,16 @@ def main():
     port = int(sys.argv[1])
     t0 = time.time()
     eng = Engine(MODEL)
-    # warm-up: compile every kernel shape the judged requests use (random prompts; the cache is cleared after):
-    # fresh prompts, and prompts that share a prefix with an earlier one and so resume part way
+    # warm-up: Triton compiles a kernel variant per integer-argument class (== 1, divisible by 16, other), so run
+    # prefill chunks of every class of length and start position, then whole requests (random tokens; the cache
+    # is cleared after)
     g = torch.Generator().manual_seed(0)
     rnd = lambda k: torch.randint(1000, 100000, (k,), generator=g).tolist()
+    ids = torch.tensor(rnd(4096), device="cuda")
+    for p0 in (6400, 6404, 6401):
+        for T in (1, 2, 16, 17, 32, 1595, 1600, 4096):
+            hn = eng.pre.chunk(ids[:T], p0, eng.st)
+            eng.pre.mtp(ids[:T], hn, p0, eng.st)
     base = rnd(12000)
     eng.generate(rnd(8000), 32)
     eng.generate(base, 32)

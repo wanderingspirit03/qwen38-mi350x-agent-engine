@@ -184,12 +184,13 @@ __global__ void conv_commit_kernel(const int* __restrict__ n_dev, const bf16* __
 }
 
 // prefill: out (T, 6144) bf16 = gated RMSNorm of o (T, 48, 128) fp32 with z from proj. grid (T, 48), block 128.
-__global__ __launch_bounds__(128) void gated_norm_kernel(const float* __restrict__ o, const bf16* __restrict__ proj,
+template <typename TO>
+__global__ __launch_bounds__(128) void gated_norm_kernel(const TO* __restrict__ o, const bf16* __restrict__ proj,
                                                          int pstride, const bf16* __restrict__ gw,
                                                          bf16* __restrict__ out) {
   int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
   __shared__ float red[2];
-  float x = rbf(o[((size_t)t * NH + h) * DK + i]);
+  float x = rbf((float)o[((size_t)t * NH + h) * DK + i]);
   float s = x * x;
   for (int m = 32; m > 0; m >>= 1) s += __shfl_xor(s, m);
   if ((i & 63) == 0) red[i >> 6] = s;
@@ -199,10 +200,49 @@ __global__ __launch_bounds__(128) void gated_norm_kernel(const float* __restrict
   out[(size_t)t * VD + h * DK + i] = __float2bfloat16(rbf(rbf(x * r) * bf(gw[i])) * (z / (1.f + __expf(-z))));
 }
 
+// prefill: y (T, 10240) bf16 = silu(conv) of q|k|v (raw, not normalized); gb (T, 2, 48) = g, beta.
+// grid (T, 81), block 128.
+__global__ void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride, const bf16* __restrict__ hist,
+                                const bf16* __restrict__ cw, const float* __restrict__ aneg,
+                                const float* __restrict__ dtb, bf16* __restrict__ y, float* __restrict__ gb) {
+  int t = blockIdx.x, grp = blockIdx.y, i = threadIdx.x;
+  if (grp == 80) {
+    if (i < NH) {
+      float b = bf(proj[(size_t)t * pstride + NCH + VD + i]);
+      float a = bf(proj[(size_t)t * pstride + NCH + VD + NH + i]);
+      float x = a + dtb[i];
+      float sp = x > 20.f ? x : log1pf(expf(x));
+      gb[(t * 2 + 0) * NH + i] = aneg[i] * sp;
+      gb[(t * 2 + 1) * NH + i] = 1.f / (1.f + expf(-b));
+    }
+    return;
+  }
+  int c = grp * 128 + i;
+  float acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int r = t + j;
+    float xv = r < 3 ? bf(hist[r * NCH + c]) : bf(proj[(size_t)(r - 3) * pstride + c]);
+    acc += xv * bf(cw[c * 4 + j]);
+  }
+  y[(size_t)t * NCH + c] = __float2bfloat16(acc / (1.f + expf(-acc)));
+}
+
 extern "C" {
+int gdn_conv(int T, const void* proj, int pstride, const void* hist, const void* cw, const void* aneg,
+             const void* dtb, void* y, void* gb, hipStream_t s) {
+  hipLaunchKernelGGL(gdn_conv_kernel, dim3(T, 81), dim3(128), 0, s, (const bf16*)proj, pstride, (const bf16*)hist,
+                     (const bf16*)cw, (const float*)aneg, (const float*)dtb, (bf16*)y, (float*)gb);
+  return (int)hipGetLastError();
+}
 int gated_norm(int T, const void* o, const void* proj, int pstride, const void* gw, void* out, hipStream_t s) {
-  hipLaunchKernelGGL(gated_norm_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
+  hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
+  return (int)hipGetLastError();
+}
+int gated_norm_bf16(int T, const void* o, const void* proj, int pstride, const void* gw, void* out, hipStream_t s) {
+  hipLaunchKernelGGL(gated_norm_kernel<bf16>, dim3(T, NH), dim3(128), 0, s, (const bf16*)o, (const bf16*)proj,
+                     pstride, (const bf16*)gw, (bf16*)out);
   return (int)hipGetLastError();
 }
 int conv_update(const void* n_dev, const void* proj, int pstride, void* hist, hipStream_t s) {
@@ -220,7 +260,7 @@ int gdn_verify(int T, const void* qk, const void* v, const void* gb, const void*
                int pstride, const void* gw, void* out, hipStream_t s) {
   hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * 4), 0, s, T, (const float*)qk, (const float*)v,
                      (const float*)gb, (const float*)state, (float*)o);
-  hipLaunchKernelGGL(gated_norm_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
+  hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
   return (int)hipGetLastError();
 }

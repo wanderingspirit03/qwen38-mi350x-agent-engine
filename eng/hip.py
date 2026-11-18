@@ -83,10 +83,14 @@ lib.gated_norm.argtypes = [I, P, P, I, P, P, P]
 lib.conv_update.argtypes = [P, P, I, P, P]
 
 
+lib.gated_norm_bf16.argtypes = [I, P, P, I, P, P, P]
+
+
 def gated_norm(o, proj, gw, out):
-    """o (T, 48, 128) fp32 -> out (T, 6144) bf16, gated by z = proj[:, 10240:16384]."""
+    """o (T, 48, 128) fp32 or bf16 -> out (T, 6144) bf16, gated by z = proj[:, 10240:16384]."""
     assert o.is_contiguous() and out.is_contiguous()
-    _check(lib.gated_norm(o.shape[0], p(o), p(proj), proj.stride(0), p(gw), p(out), stream()), "gated_norm")
+    f = lib.gated_norm_bf16 if o.dtype == torch.bfloat16 else lib.gated_norm
+    _check(f(o.shape[0], p(o), p(proj), proj.stride(0), p(gw), p(out), stream()), "gated_norm")
 
 
 def conv_update(n_dev, proj, hist):
@@ -101,3 +105,13 @@ def quant_fp8(x, q, sc):
     """x (R, K) bf16 (K % 8 == 0, rows may be strided) -> q (R, K) float8_e4m3fn, sc (R, 1) fp32 row scales."""
     assert x.stride(1) == 1 and x.shape[1] % 8 == 0 and q.is_contiguous()
     _check(lib.quant_fp8(x.shape[0], x.shape[1], p(x), x.stride(0), p(q), p(sc), stream()), "quant_fp8")
+
+
+lib.gdn_conv.argtypes = [I, P, I, P, P, P, P, P, P, P]
+
+
+def gdn_conv(proj, hist, cw, aneg, dtb, y, gb):
+    """Prefill: y (T, 10240) bf16 = silu(conv(q|k|v)), raw; gb (T, 2, 48) fp32 = g, beta."""
+    T = proj.shape[0]
+    _check(lib.gdn_conv(T, p(proj), proj.stride(0), p(hist), p(cw), p(aneg), p(dtb), p(y), p(gb), stream()),
+           "gdn_conv")
