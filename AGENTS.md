@@ -105,5 +105,20 @@ on one GPU. A separate program, the judge, measures the engine.
   engine: an engine that reads fewer bytes per token (smaller weights,
   speculative decoding) can be faster.
 
+## Models
+Two models are available: `anthropic/claude-opus-5-5` and `anthropic/claude-sonnet-5-5`.
+`rlm.spawn` takes `model` and `thinking`; choose them per task. The main
+agent runs on the first at `high`; a child gets its parent's level unless
+`thinking` sets one. The reasoning levels, from least to most:
+- `off`: no reasoning; the fastest and cheapest.
+- `minimal`: almost none; nearly as fast and cheap as `off`.
+- `low`: a little; fast and cheap.
+- `medium`: moderate effort, speed and cost.
+- `high`: more effort; slower and costlier.
+- `xhigh`: more than `high`; slower and costlier again.
+- `max`: the most effort; the slowest and costliest.
+Prime Agent's model catalog gives these two models no setting of their own
+for `off` and `minimal`.
+
 ## The end of the run
 There is no finish line. The run ends when the operator stops it.
