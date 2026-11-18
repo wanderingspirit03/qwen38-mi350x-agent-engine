@@ -105,7 +105,7 @@ def new_xa(M, K, device="cuda"):
     NG = K // 128
     return {"xq": torch.empty(M, K, dtype=torch.int8, device=device),
             "xg": torch.empty(M, NG, 2, dtype=torch.float32, device=device),
-            "xzp": torch.empty(M, _ngp(K), dtype=torch.bfloat16, device=device), "M": M, "K": K}
+            "xzp": torch.zeros(M, _ngp(K), dtype=torch.bfloat16, device=device), "M": M, "K": K}
 
 
 def quant_x(x, xa=None, norm_weight=None):

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from . import hip as H
 from .kernels import w4 as w4q
+from .kernels import w4a8
 from .kernels.attention import attn_decode
 from .model import (CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, N_LAYERS, V_DIM, VOCAB)
 
@@ -36,6 +37,7 @@ class SeqState:
 
 
 HEAD_BITS = int(os.environ.get("ENG_HEAD_BITS", "8"))     # target LM head: 4, 8 or 16 bits (the draft head is 4-bit)
+W4A8 = os.environ.get("ENG_W4A8", "0")    # 1: int8-activation GEMMs (eng.kernels.w4a8) in the target model; mtp: also MTP
 
 
 class Linear:
@@ -48,6 +50,21 @@ class Linear:
 
     def __call__(self, x, out, add=False):
         w4q.gemm(x, self.p, out=out, residual=out if add else None)
+
+
+class A8Linear:
+    """As Linear, with int8 activations (eng.kernels.w4a8; the norm weight is applied to x, not folded into W).
+    x is quantized by a small kernel in front of each GEMM, into buffers shared per (M, K)."""
+    xa = {}
+
+    def __init__(self, w, norm=None, swiglu=False):
+        self.p = w4a8.quantize(w, norm_weight=norm, swiglu=swiglu)
+
+    def __call__(self, x, out, add=False):
+        key = (x.shape[0], x.shape[1], x.device)
+        if key not in A8Linear.xa:
+            A8Linear.xa[key] = w4a8.new_xa(x.shape[0], x.shape[1], x.device)
+        w4a8.gemm(x, self.p, out=out, residual=out if add else None, xa=A8Linear.xa[key])
 
 
 class W8Linear(Linear):
@@ -81,10 +98,11 @@ class Fast:
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.lin = []
         for i, L in enumerate(w.layers):
-            self.lin.append(self._layer_lin(L, IS_ATTN[i]))
+            self.lin.append(self._layer_lin(L, IS_ATTN[i], A8Linear if W4A8 != "0" else Linear))
         M = w.mtp
-        self.mlin = self._layer_lin(M, True)
-        self.mlin["fc"] = Linear(M["fc"])
+        ML = A8Linear if W4A8 == "mtp" else Linear
+        self.mlin = self._layer_lin(M, True, ML)
+        self.mlin["fc"] = ML(M["fc"])
         HL = {4: Linear, 8: W8Linear, 16: Bf16Linear}[HEAD_BITS]
         self.head = HL(w.lm_head)
         # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head
@@ -129,12 +147,12 @@ class Fast:
 
     # ---- the target model on R rows ----
     @staticmethod
-    def _layer_lin(L, attn):
-        d = {"gate_up": Linear(L["gate_up"], L["post_norm"], swiglu=True), "down": Linear(L["down"])}
+    def _layer_lin(L, attn, Lin=Linear):
+        d = {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True), "down": Lin(L["down"])}
         if attn:
-            d["qkv"], d["o"] = Linear(L["qkv"], L["in_norm"]), Linear(L["o"])
+            d["qkv"], d["o"] = Lin(L["qkv"], L["in_norm"]), Lin(L["o"])
         else:
-            d["in_proj"], d["out"] = Linear(L["in_proj"], L["in_norm"]), Linear(L["out"])
+            d["in_proj"], d["out"] = Lin(L["in_proj"], L["in_norm"]), Lin(L["out"])
         return d
 
     def mlp(self, lin, rows):

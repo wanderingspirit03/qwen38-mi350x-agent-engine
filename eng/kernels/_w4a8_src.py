@@ -47,6 +47,61 @@ __device__ __forceinline__ void deq(u32x4 q, i32x4& lo, i32x4& hi) {
     }
 }
 
+// Quantize one group of 128 of one row: 16 lanes (sub = lane % 16) x 8 values; x points at the row.
+// nw (may be null): RMSNorm weight; x (1 + nw) is quantized, sum of x^2 is of the raw x (the GEMM applies 1/rms).
+// All 16 lanes must call it (shuffles); act false: lane contributes nothing and writes nothing.
+// raw: this lane's 8 values of the group
+__device__ __forceinline__ void quant_group(u32x4 raw, const __bf16* nw, int g, int m, int K, int sub, bool act,
+                                            int8_t* xq, float2* xg, __bf16* xzp) {
+    const int NG = K >> 7, NGp = (NG + 31) & ~31;
+    float v[8];
+    float amax = 0.f, sq = 0.f;
+    if (act) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            v[2 * i] = __uint_as_float(raw[i] << 16);
+            v[2 * i + 1] = __uint_as_float(raw[i] & 0xFFFF0000u);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) sq += v[i] * v[i];
+        if (nw) {
+            const u32x4 wr = *(const u32x4*)(nw + g * 128 + sub * 8);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                v[2 * i] *= 1.f + __uint_as_float(wr[i] << 16);
+                v[2 * i + 1] *= 1.f + __uint_as_float(wr[i] & 0xFFFF0000u);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
+    }
+#pragma unroll
+    for (int o = 8; o; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, o, 16));
+        sq += __shfl_xor(sq, o, 16);
+    }
+    const float sx = amax / 127.f;
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+    int s = 0;
+    if (act) {
+        uint32_t w0 = 0, w1 = 0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int q = (int)rintf(v[i] * inv);
+            s += q;
+            if (i < 4) w0 |= (uint32_t)(q & 0xFF) << (8 * i);
+            else w1 |= (uint32_t)(q & 0xFF) << (8 * (i - 4));
+        }
+        *(uint2*)(xq + (size_t)m * K + g * 128 + sub * 8) = make_uint2(w0, w1);
+    }
+#pragma unroll
+    for (int o = 8; o; o >>= 1) s += __shfl_xor(s, o, 16);
+    if (act && sub == 0) {
+        xg[(size_t)m * NG + g] = make_float2(sx / 16.f, sq);
+        xzp[(size_t)m * NGp + g] = (__bf16)(sx * (float)s);
+    }
+}
+
 template <int NT, int WAVES, bool RMS>
 __global__ __launch_bounds__(WAVES * 64)
 void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u32x4* qw, const u32x4* msc,
@@ -169,94 +224,60 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
         if (RMS)
             for (int w = 0; w < WAVES - 1; w++) ss += rss[w][lane];
     }
-    if (m >= M) return;
+    const bool mok = m < M;
     if (RMS) {
         // every lane group holds the same partial sums for row m (each lane loads its row's xg)
         const float r = rsqrtf(ss / (float)K + eps);
 #pragma unroll
         for (int t = 0; t < NT; t++) acc[t] *= r;
     }
-    if (flags & F_SWIGLU) {
-        const int N2 = N >> 1;
+    const bool sw = flags & F_SWIGLU;
+    const int Ny = sw ? N >> 1 : N;
+    auto store4 = [&](size_t o, const float* v) {     // 4 consecutive outputs, 8 bytes
+        const uint2 u = make_uint2(__builtin_bit_cast(unsigned short, (__bf16)v[0]) | ((uint32_t)__builtin_bit_cast(unsigned short, (__bf16)v[1]) << 16),
+                                   __builtin_bit_cast(unsigned short, (__bf16)v[2]) | ((uint32_t)__builtin_bit_cast(unsigned short, (__bf16)v[3]) << 16));
+        *(uint2*)(y + o) = u;
+    };
+    if (mok) {
+        if (sw) {
 #pragma unroll
-        for (int t = 0; t < NT; t += 2) {
+            for (int t = 0; t < NT; t += 2) {
+                float v[4];
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int n = ((tile0 + t) >> 1) * 16 + lg * 4 + j;
-                const float gt = (float)(__bf16)acc[t][j], up = (float)(__bf16)acc[t + 1][j];
-                y[(size_t)m * N2 + n] = (__bf16)(gt / (1.f + __expf(-gt)) * up);
+                for (int j = 0; j < 4; j++) {
+                    const float gt = (float)(__bf16)acc[t][j], up = (float)(__bf16)acc[t + 1][j];
+                    v[j] = gt / (1.f + __expf(-gt)) * up;
+                }
+                store4((size_t)m * Ny + ((tile0 + t) >> 1) * 16 + lg * 4, v);
             }
-        }
-        return;
-    }
+        } else {
 #pragma unroll
-    for (int t = 0; t < NT; t++) {
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const size_t o = (size_t)m * N + (tile0 + t) * 16 + lg * 4 + j;
-            float v = acc[t][j];
-            if (res) v += (float)res[o];
-            y[o] = (__bf16)v;
+            for (int t = 0; t < NT; t++) {
+                const size_t o = (size_t)m * N + (tile0 + t) * 16 + lg * 4;
+                float v[4] = {acc[t][0], acc[t][1], acc[t][2], acc[t][3]};
+                if (res) {
+                    const uint2 r = *(const uint2*)(res + o);
+                    v[0] += __uint_as_float(r.x << 16);
+                    v[1] += __uint_as_float(r.x & 0xFFFF0000u);
+                    v[2] += __uint_as_float(r.y << 16);
+                    v[3] += __uint_as_float(r.y & 0xFFFF0000u);
+                }
+                store4(o, v);
+            }
         }
     }
 }
 
-// x (M, K) bf16 -> xq, xg, xzp. Block of 64 threads = 4 groups, 16 lanes x 8 values per group.
-// grid (NGp / 4, M). Groups g in [NG, NGp) only write xzp = 0.
-// nw (may be null): RMSNorm weight; x (1 + nw) is quantized, sum of x^2 is of the raw x (the GEMM applies 1/rms).
+// x (M, K) bf16 -> xq, xg, xzp. Block of 64 threads = 4 groups. grid (NGp / 4, M). Groups in [NG, NGp): xzp = 0.
 __global__ __launch_bounds__(64) void quant_x_kernel(const __bf16* x, const __bf16* nw, int8_t* xq, float2* xg,
                                                      __bf16* xzp, int K) {
     const int NG = K >> 7, NGp = (NG + 31) & ~31;
     const int m = blockIdx.y;
     const int g = blockIdx.x * 4 + (threadIdx.x >> 4);
     const int sub = threadIdx.x & 15;
-    float v[8];
-    float amax = 0.f, sq = 0.f;
-    if (g < NG) {
-        const u32x4 raw = *(const u32x4*)(x + (size_t)m * K + g * 128 + sub * 8);
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            v[2 * i] = __uint_as_float(raw[i] << 16);
-            v[2 * i + 1] = __uint_as_float(raw[i] & 0xFFFF0000u);
-        }
-#pragma unroll
-        for (int i = 0; i < 8; i++) sq += v[i] * v[i];
-        if (nw) {
-            const u32x4 wr = *(const u32x4*)(nw + g * 128 + sub * 8);
-#pragma unroll
-            for (int i = 0; i < 4; i++) {
-                v[2 * i] *= 1.f + __uint_as_float(wr[i] << 16);
-                v[2 * i + 1] *= 1.f + __uint_as_float(wr[i] & 0xFFFF0000u);
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
-    }
-#pragma unroll
-    for (int o = 8; o; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, o, 16));
-        sq += __shfl_xor(sq, o, 16);
-    }
-    const float sx = amax / 127.f;
-    const float inv = amax > 0.f ? 127.f / amax : 0.f;
-    int s = 0;
-    if (g < NG) {
-        uint32_t w0 = 0, w1 = 0;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const int q = (int)rintf(v[i] * inv);
-            s += q;
-            if (i < 4) w0 |= (uint32_t)(q & 0xFF) << (8 * i);
-            else w1 |= (uint32_t)(q & 0xFF) << (8 * (i - 4));
-        }
-        *(uint2*)(xq + (size_t)m * K + g * 128 + sub * 8) = make_uint2(w0, w1);
-    }
-#pragma unroll
-    for (int o = 8; o; o >>= 1) s += __shfl_xor(s, o, 16);
-    if (sub == 0 && g < NGp) {
-        if (g < NG) xg[(size_t)m * NG + g] = make_float2(sx / 16.f, sq);
-        xzp[(size_t)m * NGp + g] = (__bf16)(sx * (float)s);
-    }
+    const u32x4 raw = g < NG ? *(const u32x4*)(x + (size_t)m * K + g * 128 + sub * 8) : u32x4{0u, 0u, 0u, 0u};
+    quant_group(raw, nw, g, m, K, sub, g < NG, xq, xg, xzp);
+    if (sub == 0 && g >= NG && g < NGp) xzp[(size_t)m * NGp + g] = (__bf16)0.f;
 }
 
 #define INST(NT, W, RMS) \
