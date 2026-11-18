@@ -37,7 +37,7 @@ class SeqState:
 
 
 HEAD_BITS = int(os.environ.get("ENG_HEAD_BITS", "8"))     # target LM head: 4, 8 or 16 bits (the draft head is 4-bit)
-W4A8 = os.environ.get("ENG_W4A8", "0")    # 1: int8-activation GEMMs (eng.kernels.w4a8) in the target model; mtp: also MTP
+W4A8 = os.environ.get("ENG_W4A8", "1")    # 1: int8-activation GEMMs (eng.kernels.w4a8) in the target model; mtp: also MTP
 
 
 FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
