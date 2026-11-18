@@ -19,7 +19,7 @@ LOG2E = 1.4426950408889634
 
 
 # ----------------------------------------------------------------------------------------------- prefill
-@triton.jit
+@triton.jit(do_not_specialize=["p0", "T", "NBLK"])   # one compiled variant for every prompt length
 def _prefill_kernel(Q, K, V, O, G, p0, T, NBLK,
                     sq_t, sq_h, sk_n, sk_h, so_t, so_h, sg_t, sg_h,
                     qk_scale,

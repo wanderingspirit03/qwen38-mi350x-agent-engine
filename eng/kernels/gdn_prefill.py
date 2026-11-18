@@ -88,7 +88,7 @@ def _block_A(ka, kb, ba, Ga, Gb, DIAG: tl.constexpr):
     return A
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "Tp"])
 def _wy_kernel(q, k, v, g, beta, w_out, u_out, G_out, qn_out, kn_out,
                T, Tp, sq, sk, sv, sg, sb, scale,
                NORM: tl.constexpr, WU_SPLIT: tl.constexpr,
@@ -195,7 +195,7 @@ def _scan_step(S, c, wt, ut, kt, Gt, Gl, hp, vnp, S_SPLIT: tl.constexpr, HV: tl.
     return S * tl.exp(Gl) + _sdot(tl.trans(kd), vn, S_SPLIT)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "Tp", "NC"])
 def _scan_kernel(k, w, u, G, state, hbuf, vn_out,
                  T, Tp, NC, sk, s_h, s_k, s_v,
                  S_SPLIT: tl.constexpr, BV: tl.constexpr,
@@ -225,7 +225,7 @@ def _scan_kernel(k, w, u, G, state, hbuf, vn_out,
     tl.store(sp, S)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "Tp"])
 def _out_kernel(q, k, G, hbuf, vn, o,
                 T, Tp, sq, sk,
                 D: tl.constexpr, HV: tl.constexpr):
