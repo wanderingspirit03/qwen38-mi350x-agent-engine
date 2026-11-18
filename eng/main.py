@@ -19,9 +19,9 @@ def main():
     # is cleared after)
     g = torch.Generator().manual_seed(0)
     rnd = lambda k: torch.randint(1000, 100000, (k,), generator=g).tolist()
-    ids = torch.tensor(rnd(4096), device="cuda")
+    ids = torch.tensor(rnd(8192), device="cuda")
     for p0 in (6400, 6404, 6401):
-        for T in (1, 2, 16, 17, 32, 1595, 1600, 4096):
+        for T in (1, 2, 16, 17, 32, 1595, 1600, 5600, 5601):
             hn = eng.pre.chunk(ids[:T], p0, eng.st)
             eng.pre.mtp(ids[:T], hn, p0, eng.st)
     base = rnd(12000)

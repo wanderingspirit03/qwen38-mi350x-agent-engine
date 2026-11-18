@@ -58,7 +58,10 @@ class PrefixCache:
         pts = set()
         if best_lcp - 1 > c0:
             pts.add(min(best_lcp - 1, n - 1))
-        pts.update(range((c0 // self.every + 1) * self.every, n - 1, self.every))
+        if best_lcp < self.every:
+            # an unshared prompt: regular checkpoints let a later prompt resume near wherever it diverges. A prompt
+            # that resumes from a shared prefix gets none: its tail is its own, and splitting costs prefill speed
+            pts.update(range((c0 // self.every + 1) * self.every, n - 1, self.every))
         return sorted(p for p in pts if p > c0 + 256)        # no tiny chunks just for a checkpoint
 
     def restore(self, e, c, work_kv, ssm, conv):

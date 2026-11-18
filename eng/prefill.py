@@ -9,7 +9,7 @@ from .kernels.attention import attn_prefill
 from .kernels.gdn_prefill import gdn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
-CHUNK = 4096
+CHUNK = 8192
 PROJ = CONV_DIM + V_DIM + 96
 
 
@@ -37,8 +37,8 @@ FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
 
-_QBUF = torch.empty(4096 * 17408, dtype=FP8, device="cuda")      # activations of one chunk, quantized
-_SBUF = torch.empty(4096, 1, dtype=torch.float32, device="cuda")
+_QBUF = torch.empty(CHUNK * 17408, dtype=FP8, device="cuda")      # activations of one chunk, quantized
+_SBUF = torch.empty(CHUNK, 1, dtype=torch.float32, device="cuda")
 
 
 class Lin:
