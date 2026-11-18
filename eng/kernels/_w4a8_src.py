@@ -23,8 +23,11 @@ typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
 #define MFMA_I8 __builtin_amdgcn_mfma_i32_16x16x64_i8
 #define MFMA_BF __builtin_amdgcn_mfma_f32_16x16x32_bf16
 #define BAR asm volatile("" ::: "memory"); __builtin_amdgcn_sched_barrier(0);
+#ifndef DEPTH
+#define DEPTH 2      // k blocks in flight per wave: 2, 3 or 4
+#endif
 
-enum { F_SWIGLU = 1 };
+enum { F_SWIGLU = 1, F_ACC = 2 };
 
 template <int NT>
 struct Frag {
@@ -113,6 +116,11 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     const int NG = K >> 7;
     const int NGp = (NG + 31) & ~31;
     const int tile0 = blockIdx.x * NT;
+    // split K: workgroup (x, s) takes groups [g0, g1); its waves take them round robin
+    const int S = gridDim.y, sk = blockIdx.y;
+    const int g0 = sk * NG / S, g1 = (sk + 1) * NG / S;
+    constexpr int KS = WAVES;
+    const int kbeg = g0 + wave, kend = g1;
 
     const __amdgpu_buffer_rsrc_t xr = __builtin_amdgcn_make_buffer_rsrc((void*)xq, 0, M * K, 0x00020000);
     const __amdgpu_buffer_rsrc_t gr = __builtin_amdgcn_make_buffer_rsrc((void*)xg, 0, M * NG * 8, 0x00020000);
@@ -121,39 +129,60 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     const u32x4* qbase = qw + (size_t)tile0 * NG * 64 + lane;
 
     auto load = [&](Frag<NT>& f, int kb) {
-        kb = min(kb, NG - 1);
+        kb = min(kb, kend - 1);
 #ifdef X_NOLOAD   // experiment: every load hits the same (cached) block
         kb = 0;
 #endif
 #pragma unroll
         for (int t = 0; t < NT; t++) f.w[t] = __builtin_nontemporal_load(qbase + ((size_t)t * NG + kb) * 64);
+#ifdef X_NOX   // experiment: no x loads
+        f.xl = i32x4{kb, 1, 2, 3}; f.xh = f.xl; f.g = make_float2(1.f, 1.f);
+#else
         f.xl = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128, 0, 0));
         f.xh = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128 + 64, 0, 0));
         f.g = __builtin_bit_cast(float2, __builtin_amdgcn_raw_buffer_load_b64(gr, (m * NG + kb) * 8, 0, 0));
+#endif
     };
-    // the first two k blocks are requested before anything else
-    Frag<NT> fa, fb;
-    if (wave < NG) {
-        load(fa, wave);
-        load(fb, wave + WAVES);
-    }
+    // the first DEPTH k blocks are requested before anything else
+    Frag<NT> f0, f1, f2, f3;
+    load(f0, kbeg);
+    load(f1, kbeg + KS);
+    if (DEPTH > 2) load(f2, kbeg + 2 * KS);
+    if (DEPTH > 3) load(f3, kbeg + 3 * KS);
     BAR
 
     // scales of the NT tiles -> LDS (NT * NG * 32 bytes, contiguous in global memory)
     extern __shared__ u32x4 lsc[];
-    {
-        const int n16 = NT * NG * 2;
-        const u32x4* src = msc + (size_t)tile0 * NG * 2;
-        for (int i = threadIdx.x; i < n16; i += WAVES * 64) lsc[i] = src[i];
-    }
-
     f32x4 acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = f32x4{0.f, 0.f, 0.f, 0.f};
     float ss = 0.f;
-
+#ifndef X_NOPRO   // experiment: no scale copy and no zero-point term
+    // zero-point operands of this wave's first chunk of 32 groups, requested now and used after the scale copy
+    const bool zt = sk == 0;     // the zero-point term is added by split 0
+    const int c0 = wave;
+    bf16x8 zb, za[NT];
+    if (zt && c0 * 32 < NG) {
+        zb = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(zr, (m * NGp + c0 * 32 + lg * 8) * 2, 0, 0));
+#pragma unroll
+        for (int t = 0; t < NT; t++)
+            za[t] = __builtin_bit_cast(bf16x8, mzp[((size_t)(tile0 + t) * 16 + m) * (NGp / 8) + c0 * 4 + lg]);
+    }
+    {
+        // scales of groups [g0, g1) of the NT tiles; LDS keeps the global layout [t][NG][2 x 16 bytes]
+        const int len = (g1 - g0) * 2, n16 = NT * len;
+        const u32x4* src = msc + (size_t)tile0 * NG * 2;
+        for (int i = threadIdx.x; i < n16; i += WAVES * 64) {
+            const int t = i / len, j = t * NG * 2 + g0 * 2 + i - t * len;
+            lsc[j] = src[j];
+        }
+    }
+    if (zt && c0 * 32 < NG) {
+#pragma unroll
+        for (int t = 0; t < NT; t++) acc[t] = MFMA_BF(za[t], zb, acc[t], 0, 0, 0);
+    }
     // zero-point term: acc = sum_g (-sw (z - 8)) (sx S), chunks of 32 groups spread over the waves
-    for (int c = wave; c * 32 < NG; c += WAVES) {
+    for (int c = wave + WAVES; zt && c * 32 < NG; c += WAVES) {
         const bf16x8 b = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(zr, (m * NGp + c * 32 + lg * 8) * 2, 0, 0));
 #pragma unroll
         for (int t = 0; t < NT; t++) {
@@ -161,6 +190,7 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
             acc[t] = MFMA_BF(a, b, acc[t], 0, 0, 0);
         }
     }
+#endif
 
     const char* ls = (const char*)lsc;
     auto mma = [&](const Frag<NT>& f, Pend<NT>& p) {
@@ -195,31 +225,31 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
         }
     };
 
+    // ring of DEPTH k blocks in flight per wave; the scale epilogue of a block runs after the MFMAs of the next
     {
-        Pend<NT> pa, pb;
-        int kb = wave;
+        Pend<NT> p0, p1, p2, p3;
+        Pend<NT>& plast = DEPTH == 2 ? p1 : DEPTH == 3 ? p2 : p3;
+#pragma unroll
+        for (int t = 0; t < NT; t++) plast.a[t] = i32x4{0, 0, 0, 0};
+        plast.g = make_float2(0.f, 0.f);
+        int kb = kbeg;
         __syncthreads();
-        if (kb < NG) {
-            BAR
-            mma(fa, pa);
-            BAR
+#define STEP(F, PC, PP) \
+        BAR \
+        mma(F, PC); \
+        load(F, kb + DEPTH * KS); \
+        epi(PP, max(kb - KS, kbeg)); \
+        BAR \
+        kb += KS; \
+        if (kb >= kend) { epi(PC, kb - KS); break; }
+        if (kb < kend) {
             while (true) {
-                kb += WAVES;
-                if (kb >= NG) { epi(pa, kb - WAVES); break; }
-                load(fa, kb + WAVES);
-                BAR
-                mma(fb, pb);
-                epi(pa, kb - WAVES);
-                BAR
-                kb += WAVES;
-                if (kb >= NG) { epi(pb, kb - WAVES); break; }
-                load(fb, kb + WAVES);
-                BAR
-                mma(fa, pa);
-                epi(pb, kb - WAVES);
-                BAR
+                if (DEPTH == 2) { STEP(f0, p0, p1) STEP(f1, p1, p0) }
+                if (DEPTH == 3) { STEP(f0, p0, p2) STEP(f1, p1, p0) STEP(f2, p2, p1) }
+                if (DEPTH == 4) { STEP(f0, p0, p3) STEP(f1, p1, p0) STEP(f2, p2, p1) STEP(f3, p3, p2) }
             }
         }
+#undef STEP
     }
 
     if (WAVES > 1) {
@@ -252,7 +282,13 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
                                    __builtin_bit_cast(unsigned short, (__bf16)v[2]) | ((uint32_t)__builtin_bit_cast(unsigned short, (__bf16)v[3]) << 16));
         *(uint2*)(y + o) = u;
     };
-    if (mok) {
+    if (mok && (flags & F_ACC)) {     // fp32 y += partial sum (split K); quant_x adds y to the residual
+        float* ya = (float*)y;
+#pragma unroll
+        for (int t = 0; t < NT; t++)
+#pragma unroll
+            for (int j = 0; j < 4; j++) unsafeAtomicAdd(ya + (size_t)m * N + (tile0 + t) * 16 + lg * 4 + j, acc[t][j]);
+    } else if (mok) {
         if (sw) {
 #pragma unroll
             for (int t = 0; t < NT; t += 2) {
@@ -283,20 +319,36 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
 }
 
 // x (M, K) bf16 -> xq, xg, xzp. Block of 64 threads = 4 groups. grid (NGp / 4, M). Groups in [NG, NGp): xzp = 0.
-__global__ __launch_bounds__(64) void quant_x_kernel(const __bf16* x, const __bf16* nw, int8_t* xq, float2* xg,
-                                                     __bf16* xzp, int K) {
+// acc (may be null): fp32 (M, K) sums of F_ACC GEMMs; x += acc (in place, rounded to bf16) and acc = 0 first.
+__global__ __launch_bounds__(64) void quant_x_kernel(__bf16* x, const __bf16* nw, int8_t* xq, float2* xg,
+                                                     __bf16* xzp, float* acc, int K) {
     const int NG = K >> 7, NGp = (NG + 31) & ~31;
     const int m = blockIdx.y;
     const int g = blockIdx.x * 4 + (threadIdx.x >> 4);
     const int sub = threadIdx.x & 15;
-    const u32x4 raw = g < NG ? *(const u32x4*)(x + (size_t)m * K + g * 128 + sub * 8) : u32x4{0u, 0u, 0u, 0u};
+    const size_t o = (size_t)m * K + g * 128 + sub * 8;
+    u32x4 raw = g < NG ? *(const u32x4*)(x + o) : u32x4{0u, 0u, 0u, 0u};
+    if (acc && g < NG) {
+        float4* ap = (float4*)(acc + o);
+        const float4 a0 = ap[0], a1 = ap[1];
+        const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float lo = __uint_as_float(raw[i] << 16) + a[2 * i];
+            const float hi = __uint_as_float(raw[i] & 0xFFFF0000u) + a[2 * i + 1];
+            raw[i] = __builtin_bit_cast(unsigned short, (__bf16)lo) | ((uint32_t)__builtin_bit_cast(unsigned short, (__bf16)hi) << 16);
+        }
+        *(u32x4*)(x + o) = raw;
+        ap[0] = make_float4(0.f, 0.f, 0.f, 0.f);
+        ap[1] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
     quant_group(raw, nw, g, m, K, sub, g < NG, xq, xg, xzp);
     if (sub == 0 && g >= NG && g < NGp) xzp[(size_t)m * NGp + g] = (__bf16)0.f;
 }
 
 #define INST(NT, W, RMS) \
     if (nt == NT && waves == W && rms == RMS) { \
-        hipLaunchKernelGGL((w4a8_kernel<NT, W, RMS>), dim3(N / 16 / NT), dim3(W * 64), NT * (K / 128) * 32, stream, \
+        hipLaunchKernelGGL((w4a8_kernel<NT, W, RMS>), dim3(N / 16 / NT, splits), dim3(W * 64), NT * (K / 128) * 32, stream, \
             (const int8_t*)xq, (const float2*)xg, (const __bf16*)xzp, (const u32x4*)qw, (const u32x4*)msc, \
             (const u32x4*)mzp, (__bf16*)y, (const __bf16*)res, M, N, K, flags, eps); \
         return 0; }
@@ -305,16 +357,16 @@ __global__ __launch_bounds__(64) void quant_x_kernel(const __bf16* x, const __bf
 
 extern "C" int w4a8_gemm(const void* xq, const void* xg, const void* xzp, const void* qw, const void* msc,
                          const void* mzp, void* y, const void* res, int M, int N, int K, int nt, int waves,
-                         int rms, int flags, float eps, hipStream_t stream) {
+                         int rms, int flags, float eps, int splits, hipStream_t stream) {
     INST_R(0) INST_R(1)
     return -1;
 }
 
-extern "C" int w4a8_quant_x(const void* x, const void* nw, void* xq, void* xg, void* xzp, int M, int K,
+extern "C" int w4a8_quant_x(void* x, const void* nw, void* xq, void* xg, void* xzp, void* acc, int M, int K,
                             hipStream_t stream) {
     const int NGp = ((K >> 7) + 31) & ~31;
-    hipLaunchKernelGGL(quant_x_kernel, dim3(NGp / 4, M), dim3(64), 0, stream, (const __bf16*)x, (const __bf16*)nw, (int8_t*)xq,
-                       (float2*)xg, (__bf16*)xzp, K);
+    hipLaunchKernelGGL(quant_x_kernel, dim3(NGp / 4, M), dim3(64), 0, stream, (__bf16*)x, (const __bf16*)nw, (int8_t*)xq,
+                       (float2*)xg, (__bf16*)xzp, (float*)acc, K);
     return 0;
 }
 """

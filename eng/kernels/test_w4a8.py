@@ -50,6 +50,77 @@ def check_all_configs(N=5120, K=6144):
         print(f"vs bf16 rmsnorm + matmul, M={M}: w4a8 fused norm {rel(y1, y0):.4f}, w4 {rel(y4, y0):.4f}", flush=True)
 
 
+def check_acc(N=5120, K=6144):
+    """gemm(..., acc=) over configurations and splits, and quant_x(..., acc=) folding it into the residual."""
+    w = torch.randn(N, K, device="cuda").bfloat16()
+    p = w4a8.quantize(w)
+    bad = n = 0
+    for M in (1, 9, 16):
+        x = (torch.randn(M, K, device="cuda") * 3).bfloat16()
+        yr = w4a8.reference(x, p)
+        xa = w4a8.quant_x(x)
+        for nt in (1, 2, 4, 8):
+            for waves in (1, 2, 4, 8):
+                for splits in (1, 2, 3, 7):
+                    acc = torch.zeros(M, N, device="cuda")
+                    w4a8.gemm(xa, p, acc=acc, cfg=(nt, waves, splits))
+                    w4a8.gemm(xa, p, acc=acc, cfg=(nt, waves, splits))
+                    e = rel(acc, 2 * yr)
+                    n += 1
+                    if not e < 5e-3:
+                        bad += 1
+                        print(f"FAIL acc M={M} cfg={(nt, waves, splits)} err {e:.3e}", flush=True)
+        r = torch.randn(M, N, device="cuda").bfloat16()
+        acc = torch.zeros(M, N, device="cuda")
+        w4a8.gemm(xa, p, acc=acc)
+        r2 = r.clone()
+        q2 = w4a8.quant_x(r2, acc=acc)
+        e = rel(r2, r.float() + yr)
+        q3 = w4a8.quant_x((r.float() + yr).bfloat16())
+        print(f"quant_x acc fold M={M}: x err {e:.2e}, acc left {acc.abs().max().item()}, "
+              f"xq diff {(q2['xq'].float() - q3['xq'].float()).abs().max().item()}", flush=True)
+    print(f"acc configs: {bad} failures of {n}", flush=True)
+
+
+def bench_acc(names, Ms, cfgs):
+    for name in names:
+        N, K, _, nn = SHAPES[name]
+        ncopy = max(2, (2 << 30) // (N * K // 2) + 1)
+        ps = [make_packed(N, K) for _ in range(ncopy)]
+        nb = w4a8.nbytes(ps[0])
+        for M in Ms:
+            x = torch.randn(M, K, device="cuda").bfloat16()
+            xa = w4a8.quant_x(x)
+            acc = torch.zeros(M, N, device="cuda")
+            out = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
+            line = f"{name:8s} {N}x{K} M={M:2d}:"
+            best = None
+            for cfg in cfgs + [None]:
+                c = cfg or w4a8.acc_config_for(N, K, M)
+                if N % (16 * c[0]) or c[0] * (K // 128) * 32 > 65536:
+                    continue
+                t = graph_time([lambda p=p: w4a8.gemm(xa, p, acc=acc, cfg=cfg) for p in ps])
+                if cfg:
+                    line += f" {c[0]},{c[1]},{c[2]}:{t * 1e6:.1f}"
+                if best is None or t < best[0]:
+                    best = (t, c)
+            line += f" | acc {best[1]} {best[0] * 1e6:.1f} us {nb / best[0] / 1e12:.2f} TB/s"
+            t0 = graph_time([lambda p=p: w4a8.gemm(xa, p, out=out, residual=out) for p in ps])
+            line += f" | residual {w4a8.config_for(N, K, M)} {t0 * 1e6:.1f} us"
+            xr = torch.randn(M, 5120, device="cuda").bfloat16()
+            xa2 = w4a8.new_xa(M, 5120)
+            acc2 = torch.zeros(M, 5120, device="cuda")
+            tq0 = graph_time([lambda: w4a8.quant_x(xr, xa2)] * 2)
+            tq1 = graph_time([lambda: w4a8.quant_x(xr, xa2, acc=acc2)] * 2)
+            line += f" | quant_x K=5120 {tq0 * 1e6:.1f} us, with acc {tq1 * 1e6:.1f} us"
+            print(line, flush=True)
+        del ps
+        torch.cuda.empty_cache()
+
+
+ACC_CFGS = [(nt, w, s) for nt in (2, 4, 8) for w in (2, 4, 8) for s in (2, 3, 4, 6)]
+
+
 def check_gdnq():
     """eng.hip.gdn_verify_q against gdn_verify + quant_x."""
     from .. import hip as H
@@ -156,6 +227,10 @@ def main():
     print(f"build {time.time() - t:.1f} s", flush=True)
     if mode == "allcfg":
         check_all_configs()
+    if mode == "acc":
+        check_acc()
+    if mode == "acctune":
+        bench_acc(names, Ms, ACC_CFGS)
     if mode == "gdnq":
         check_gdnq()
         check_attnq()

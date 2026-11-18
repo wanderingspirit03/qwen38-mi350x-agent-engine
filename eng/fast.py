@@ -38,6 +38,7 @@ class SeqState:
 
 HEAD_BITS = int(os.environ.get("ENG_HEAD_BITS", "8"))     # target LM head: 4, 8 or 16 bits (the draft head is 4-bit)
 W4A8 = os.environ.get("ENG_W4A8", "1")    # 1: int8-activation GEMMs (eng.kernels.w4a8) in the target model; mtp: also MTP
+A8_ACC = os.environ.get("ENG_A8_ACC", "1") == "1"     # residual-adding W4A8 GEMMs split K, sums added by the next quant
 
 
 FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
@@ -65,21 +66,50 @@ class Linear:
 
 class A8Linear:
     """As Linear, with int8 activations (eng.kernels.w4a8; the norm weight is applied to x, not folded into W).
-    x is quantized by a small kernel in front of each GEMM, into buffers shared per (M, K)."""
+    x is quantized by a small kernel in front of each GEMM, into buffers shared per (M, K).
+    add=True (A8_ACC): the GEMM splits K over workgroups and adds fp32 sums into a buffer kept per residual
+    tensor; the next A8Linear reading that tensor adds them in while quantizing it, else flush() does."""
     xa = {}
+    acc = {}        # residual tensor's data_ptr -> fp32 (16, K)
+    pending = {}    # data_ptr -> rows with sums not yet added
 
     def __init__(self, w, norm=None, swiglu=False):
         self.p = w4a8.quantize(w, norm_weight=norm, swiglu=swiglu)
 
+    @staticmethod
+    def _xa(x):
+        key = (x.shape[0], x.shape[1], x.device)
+        if key not in A8Linear.xa:
+            A8Linear.xa[key] = w4a8.new_xa(x.shape[0], x.shape[1], x.device)
+        return A8Linear.xa[key]
+
+    @staticmethod
+    def _take(x):
+        rows = A8Linear.pending.pop(x.data_ptr(), None)
+        assert rows is None or rows == x.shape[0]
+        return None if rows is None else A8Linear.acc[x.data_ptr()][:rows]
+
+    @staticmethod
+    def flush(x):
+        """Add pending GEMM sums to the residual tensor x."""
+        acc = A8Linear._take(x)
+        if acc is not None:
+            w4a8.quant_x(x, A8Linear._xa(x), acc=acc)
+
     def __call__(self, x, out, add=False):
         """x: (M, K) bf16, or an already quantized activation dict"""
-        xa = None
         if not isinstance(x, dict):
-            key = (x.shape[0], x.shape[1], x.device)
-            if key not in A8Linear.xa:
-                A8Linear.xa[key] = w4a8.new_xa(x.shape[0], x.shape[1], x.device)
-            xa = A8Linear.xa[key]
-        w4a8.gemm(x, self.p, out=out, residual=out if add else None, xa=xa)
+            x = w4a8.quant_x(x, A8Linear._xa(x), self.p["norm"], acc=A8Linear._take(x))
+        if add and A8_ACC:
+            k = out.data_ptr()
+            if k not in A8Linear.acc:
+                A8Linear.acc[k] = torch.zeros(16, out.shape[1], dtype=torch.float32, device=out.device)
+            assert A8Linear.pending.get(k, out.shape[0]) == out.shape[0]
+            A8Linear.pending[k] = out.shape[0]
+            w4a8.gemm(x, self.p, acc=A8Linear.acc[k][:out.shape[0]])
+        else:
+            assert out.data_ptr() not in A8Linear.pending
+            w4a8.gemm(x, self.p, out=out, residual=out if add else None)
 
 
 class W8Linear(Linear):
@@ -204,6 +234,7 @@ class Fast:
                     lin["out"](self.go, self.x, add=True)
                 gi += 1
             self.mlp(lin, R)
+        A8Linear.flush(self.x)
         H.add_rmsnorm(self.x, None, w.final_norm, self.hn)
         self.head(self.hn, self.logits)
         H.argmax_rows(self.logits, self.y)
@@ -242,6 +273,7 @@ class Fast:
         self.mlin["fc"](self.mx[:R], self.x[:R])
         self.attn(self.mlin, M, 16, st, pos, nkv, R)
         self.mlp(self.mlin, R)
+        A8Linear.flush(self.x[:R])
         if R == 1:
             H.add_rmsnorm(self.x[:1], None, M["norm"], self.mhn[:1])
         else:
