@@ -75,6 +75,29 @@ def _pack(u, s, z):
     return packed.reshape(n // 16, K // 128, 256), torch.cat([sc, zc], -1)
 
 
+def rtn_search(wc, clip_search=True):
+    """wc (n, NG, G) fp32 -> codes u (n, NG, G) int32 in 0..15, scales s and zero points z (n, NG) fp32 (s is
+    fp16-representable): asymmetric round-to-nearest, clipping ratio per group chosen by least squares."""
+    lo = wc.amin(-1).clamp(max=0)
+    hi = wc.amax(-1).clamp(min=0)
+    best_err = best_s = best_z = None
+    for a in (torch.linspace(1.0, 0.75, 11).tolist() if clip_search else [1.0]):
+        s = ((hi - lo) * a / 15).clamp(min=1e-8).half().float()
+        z = (-lo * a / s).round().clamp(0, 15)
+        u = (wc / s[..., None]).round().add_(z[..., None]).clamp_(0, 15)
+        err = ((u - z[..., None]).mul_(s[..., None]).sub_(wc)).square_().sum(-1)
+        if best_err is None:
+            best_err, best_s, best_z = err, s, z
+        else:
+            b = err < best_err
+            best_err = torch.where(b, err, best_err)
+            best_s = torch.where(b, s, best_s)
+            best_z = torch.where(b, z, best_z)
+    s, z = best_s, best_z
+    u = (wc / s[..., None]).round().add_(z[..., None]).clamp_(0, 15).to(torch.int32)
+    return u, s, z
+
+
 @torch.no_grad()
 def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192):
     """w: (N, K) CUDA tensor. Returns the packed weight (dict). See the module docstring."""
@@ -89,24 +112,7 @@ def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, row
         wc = w[r0:r0 + rows_per_chunk].float()
         if norm_weight is not None:
             wc = wc * (1 + norm_weight.float())[None]
-        wc = wc.reshape(-1, K // G, G)
-        lo = wc.amin(-1).clamp(max=0)
-        hi = wc.amax(-1).clamp(min=0)
-        best_err = best_s = best_z = None
-        for a in (torch.linspace(1.0, 0.75, 11).tolist() if clip_search else [1.0]):
-            s = ((hi - lo) * a / 15).clamp(min=1e-8).half().float()
-            z = (-lo * a / s).round().clamp(0, 15)
-            u = (wc / s[..., None]).round().add_(z[..., None]).clamp_(0, 15)
-            err = ((u - z[..., None]).mul_(s[..., None]).sub_(wc)).square_().sum(-1)
-            if best_err is None:
-                best_err, best_s, best_z = err, s, z
-            else:
-                b = err < best_err
-                best_err = torch.where(b, err, best_err)
-                best_s = torch.where(b, s, best_s)
-                best_z = torch.where(b, z, best_z)
-        s, z = best_s, best_z
-        u = (wc / s[..., None]).round().add_(z[..., None]).clamp_(0, 15).to(torch.int32)
+        u, s, z = rtn_search(wc.reshape(-1, K // G, G), clip_search)
         q, m = _pack(u, s, z)
         qs.append(q)
         ms.append(m)
