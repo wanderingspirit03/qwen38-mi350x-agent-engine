@@ -93,7 +93,7 @@ def _nblocks(mb, p0, n, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     return (tl.minimum(p0 + (mb + 1) * BLOCK_M, n) + BLOCK_N - 1) // BLOCK_N
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["p0", "T", "NBLK", "KTOT"])
 def _prefill_sk_kernel(Q, K, V, O, G, WO, WL, p0, T, NBLK, KTOT, NPROG,
            sq_t, sq_h, sk_n, sk_h, so_t, so_h, sg_t, sg_h,
            qk_scale,
@@ -176,7 +176,7 @@ def _prefill_sk_kernel(Q, K, V, O, G, WO, WL, p0, T, NBLK, KTOT, NPROG,
             nb = _nblocks(NBLK - 1 - r, p0, n, BLOCK_M, BLOCK_N)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["p0", "T", "NBLK", "KTOT"])
 def _prefill_merge_kernel(O, G, WO, WL, p0, T, NBLK, KTOT, NPROG, so_t, so_h, sg_t, sg_h,
               D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_GATE: tl.constexpr):
     # one program per item; items done by one program only were written by _prefill_sk_kernel
