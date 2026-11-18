@@ -34,7 +34,9 @@ __device__ __forceinline__ bf16x8 deq(uint32_t q, uint32_t mask, uint32_t magic)
 
 template <bool NTL>
 __device__ __forceinline__ u32x4 ldw(const u32x4* p) {
+#ifndef W4_NO_NT   // experiment switch: plain loads for the weights
     if (NTL) return __builtin_nontemporal_load(p);
+#endif
     return *p;
 }
 
@@ -55,7 +57,7 @@ struct Pend {          // MFMA results of one k block whose scale/zero epilogue 
     uint32_t z[NT][GPB];
 };
 
-enum { F_SWIGLU = 1 };
+enum { F_SWIGLU = 1, F_XDUP = 2 };   // F_XDUP: x has K/2 columns, k block kb reads x block kb/2
 
 // After the k loop: split-k reduction (the last of the ksplit workgroups of a unit adds the partials up),
 // 1/rms scaling, then SwiGLU or the (optional) residual add, and the bf16 store. unit: index of the
@@ -171,8 +173,10 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
 
     const bool mok = m < M;
     // x through a buffer whose range ends at row M: lanes of rows m >= M read zeros and no memory
-    const __amdgpu_buffer_rsrc_t xrsrc = __builtin_amdgcn_make_buffer_rsrc((void*)x, 0, M * K * 2, 0x00020000);
-    const int xoff = (m * K + lg * 8) * 2;
+    const int xsh = (flags & F_XDUP) ? 1 : 0;
+    const int Kx = K >> xsh;
+    const __amdgpu_buffer_rsrc_t xrsrc = __builtin_amdgcn_make_buffer_rsrc((void*)x, 0, M * Kx * 2, 0x00020000);
+    const int xoff = (m * Kx + lg * 8) * 2;
     const u32x4* qbase = qw + (size_t)tile0 * KB * 64 + lane;
     // meta records of tiles tile0.. for groups [kb0 GPB, kb1 GPB) -> LDS, 3 x 16 bytes per record
     extern __shared__ u32x4 lmeta[];
@@ -191,7 +195,7 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
         for (int t = 0; t < NT; t++) f.w[t] = ldw<NTL>(qbase + ((size_t)t * KB + kb) * 64);
 #pragma unroll
         for (int s = 0; s < 4; s++)
-            f.x[s] = __builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(xrsrc, xoff + kb * 256 + s * 64, 0, 0));
+            f.x[s] = __builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(xrsrc, xoff + (kb >> xsh) * 256 + s * 64, 0, 0));
     };
     const char* lm = (const char*)lmeta;
     auto meta_lds = [&](Pend<NT, GPB>& p, int kb) {

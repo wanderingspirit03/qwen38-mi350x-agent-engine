@@ -35,7 +35,7 @@ class SeqState:
         self.max_len = max_len
 
 
-W4_HEAD = os.environ.get("ENG_W4_HEAD", "1") == "1"
+HEAD_BITS = int(os.environ.get("ENG_HEAD_BITS", "8"))     # target LM head: 4, 8 or 16 bits (the draft head is 4-bit)
 
 
 class Linear:
@@ -48,6 +48,11 @@ class Linear:
 
     def __call__(self, x, out, add=False):
         w4q.gemm(x, self.p, out=out, residual=out if add else None)
+
+
+class W8Linear(Linear):
+    def __init__(self, w):
+        self.p = w4q.quantize8(w)
 
 
 class Bf16Linear:
@@ -80,12 +85,12 @@ class Fast:
         M = w.mtp
         self.mlin = self._layer_lin(M, True)
         self.mlin["fc"] = Linear(M["fc"])
-        HL = Linear if W4_HEAD else Bf16Linear
+        HL = {4: Linear, 8: W8Linear, 16: Bf16Linear}[HEAD_BITS]
         self.head = HL(w.lm_head)
         # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head
         dv = np.load(os.path.join(os.path.dirname(__file__), "draft_vocab.npy"))
         self.dvocab = torch.from_numpy(dv.astype(np.int64)).to(dev)
-        self.dhead = HL(w.lm_head[self.dvocab].contiguous())
+        self.dhead = Linear(w.lm_head[self.dvocab].contiguous())
         # GDN per-layer weights stacked for the all-layer commit
         G = [L for i, L in enumerate(w.layers) if not IS_ATTN[i]]
         self.cw = torch.stack([L["conv"] for L in G])

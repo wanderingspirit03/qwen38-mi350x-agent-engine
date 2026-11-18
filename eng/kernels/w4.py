@@ -11,6 +11,7 @@ API:
         norm_weight (K,): the RMSNorm in front of this matrix, x_norm = x / rms(x) * (1 + norm_weight). It is
             folded into W, and gemm() then takes the un-normalized x and computes 1/rms(x) itself.
         swiglu: w is [gate; up] (2I, K); gemm() returns silu(x @ gate^T) * (x @ up^T), (M, I).
+    p = quantize8(w, norm_weight=None): 8-bit weights (int8, groups of 128) for the same gemm().
     y = gemm(x, p, out=None, residual=None)
         x (M, K) bf16 contiguous, M <= 16 -> (M, N) bf16 (+ residual; residual may be out itself: in place).
     w = dequantize(p)    (N, K) fp32 (norm weight folded in, rows interleaved if swiglu), for checks.
@@ -59,6 +60,21 @@ def _build(prefix=None):
 _ORDER = [0, 2, 4, 6, 1, 3, 5, 7]   # nibble p of a dword holds element _ORDER[p] of the lane's 8 k values
 
 
+def _pack(u, s, z):
+    """u (n, K/G, G) int32 codes 0..15, s (n, K/G) scales, z (n, K/G) zero points 0..15 -> (qw, meta) blocks."""
+    n, NG, G = u.shape
+    K = NG * G
+    # (tile, r, kb, s, lg, e) -> (tile, kb, lg, r, s, e)
+    u = u.reshape(n // 16, 16, K // 128, 4, 4, 8).permute(0, 2, 4, 1, 3, 5)
+    u = u[..., _ORDER]
+    sh = torch.arange(0, 32, 4, device=u.device, dtype=torch.int32)
+    packed = (u << sh).sum(-1, dtype=torch.int64)
+    packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
+    sc = s.half().reshape(n // 16, 16, NG).transpose(1, 2).contiguous().view(torch.uint8)  # (tiles, NG, 32)
+    zc = (z + 128).to(torch.uint8).reshape(n // 16, 16, NG).transpose(1, 2)               # (tiles, NG, 16)
+    return packed.reshape(n // 16, K // 128, 256), torch.cat([sc, zc], -1)
+
+
 @torch.no_grad()
 def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192):
     """w: (N, K) CUDA tensor. Returns the packed weight (dict). See the module docstring."""
@@ -91,20 +107,40 @@ def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, row
                 best_z = torch.where(b, z, best_z)
         s, z = best_s, best_z
         u = (wc / s[..., None]).round().add_(z[..., None]).clamp_(0, 15).to(torch.int32)
-        n = u.shape[0]
-        # (tile, r, kb, s, lg, e) -> (tile, kb, lg, r, s, e)
-        u = u.reshape(n // 16, 16, K // 128, 4, 4, 8).permute(0, 2, 4, 1, 3, 5)
-        u = u[..., _ORDER]
-        sh = torch.arange(0, 32, 4, device=w.device, dtype=torch.int32)
-        packed = (u << sh).sum(-1, dtype=torch.int64)
-        packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
-        qs.append(packed.reshape(n // 16, K // 128, 256))
-        sc = s.half().reshape(n // 16, 16, K // G).transpose(1, 2).contiguous().view(torch.uint8)  # (tiles, NG, 32)
-        zc = (z + 128).to(torch.uint8).reshape(n // 16, 16, K // G).transpose(1, 2)               # (tiles, NG, 16)
-        ms.append(torch.cat([sc, zc], -1))
+        q, m = _pack(u, s, z)
+        qs.append(q)
+        ms.append(m)
     _workspace(w.device)
     return {"qw": torch.cat(qs).contiguous(), "meta": torch.cat(ms).contiguous(), "N": N, "K": K, "G": G,
             "rms": norm_weight is not None, "swiglu": swiglu}
+
+
+@torch.no_grad()
+def quantize8(w, norm_weight=None, rows_per_chunk=8192):
+    """8-bit weights in the 4-bit format: symmetric int8 per group of 128, q8 = round(w / s) + 128 in 1..255 is split
+    into its nibbles, q8 = 16 h + l, and w = 16 s (h - 8) + s (l - 0). Each 128-k block of W becomes two 4-bit
+    blocks (h, then l) with their own scale and zero point, so the packed matrix is (N, 2K) and gemm() reads every
+    x block twice ("xdup"). The RMSNorm fold is as in quantize(); sum(x^2) / 2K over the doubled x is the mean."""
+    N, K = w.shape
+    assert N % 16 == 0 and K % 128 == 0
+    qs, ms = [], []
+    for r0 in range(0, N, rows_per_chunk):
+        wc = w[r0:r0 + rows_per_chunk].float()
+        if norm_weight is not None:
+            wc = wc * (1 + norm_weight.float())[None]
+        n = wc.shape[0]
+        wc = wc.reshape(n, K // 128, 128)
+        s = (wc.abs().amax(-1) / 127).clamp(min=1e-8).half().float()
+        q8 = (wc / s[..., None]).round().clamp_(-127, 127).to(torch.int32) + 128
+        u = torch.stack([q8 >> 4, q8 & 15], 2).reshape(n, 2 * K // 128, 128)
+        s2 = torch.stack([16 * s, s], 2).reshape(n, -1)
+        z2 = torch.stack([torch.full_like(s, 8), torch.zeros_like(s)], 2).reshape(n, -1)
+        q, m = _pack(u, s2, z2)
+        qs.append(q)
+        ms.append(m)
+    _workspace(w.device)
+    return {"qw": torch.cat(qs).contiguous(), "meta": torch.cat(ms).contiguous(), "N": N, "K": 2 * K, "G": 128,
+            "rms": norm_weight is not None, "swiglu": False, "xdup": True}
 
 
 def dequantize(p):
@@ -120,10 +156,15 @@ def dequantize(p):
     return ((u.reshape(N, K // G, G) - z[..., None]) * s[..., None]).reshape(N, K)
 
 
+def dequantize8(p):
+    """(N, K) fp32 weights of a quantize8() result."""
+    return dequantize(p).reshape(p["N"], -1, 2, 128).sum(2).reshape(p["N"], -1)
+
+
 def reference(x, p, residual=None):
     """What gemm() computes, in fp32 PyTorch (from the dequantized weights)."""
     xf = x.float()
-    y = xf @ dequantize(p).t()
+    y = xf @ (dequantize8(p) if p.get("xdup") else dequantize(p)).t()
     if p["rms"]:
         y = y * torch.rsqrt(xf.square().mean(-1, keepdim=True) + EPS)
     if p["swiglu"]:
@@ -162,6 +203,8 @@ CONFIGS = {
     (248320, 5120): [(4, (2, 1, 1)), (12, (4, 1, 1)), (16, (8, 1, 1))],               # LM head
     (5120, 10240): [(16, (2, 8, 1))],                                                 # MTP fc
     (32768, 5120): [(4, (2, 8, 1)), (16, (4, 4, 1))],                                 # draft head
+    (248320, 10240): [(4, (2, 8, 1)), (12, (4, 4, 1)), (16, (8, 1, 1))],              # LM head, 8-bit (quantize8)
+    (32768, 10240): [(4, (2, 8, 1)), (12, (4, 4, 1)), (16, (8, 4, 1))],               # draft head, 8-bit
 }
 DEFAULT = [(4, (2, 4, 1)), (16, (2, 2, 1))]
 
@@ -179,9 +222,10 @@ def config_for(N, K, M):
 def gemm(x, p, out=None, residual=None, cfg=None):
     """x: (M, K) bf16 contiguous, M <= 16. Returns (M, N) bf16 = x @ W^T (+ residual). See module docstring."""
     lib = _build()
-    M, K = x.shape
-    N = p["N"]
-    assert K == p["K"] and 1 <= M <= 16 and x.dtype == torch.bfloat16 and x.is_contiguous()
+    M = x.shape[0]
+    N, K = p["N"], p["K"]
+    xdup = p.get("xdup", False)
+    assert x.shape[1] * (2 if xdup else 1) == K and 1 <= M <= 16 and x.dtype == torch.bfloat16 and x.is_contiguous()
     No = N // 2 if p["swiglu"] else N
     assert residual is None or (not p["swiglu"] and residual.shape == (M, N) and residual.is_contiguous())
     if out is None:
@@ -195,6 +239,6 @@ def gemm(x, p, out=None, residual=None, cfg=None):
     rc = lib.w4_gemm(x.data_ptr(), p["qw"].data_ptr(), p["meta"].data_ptr(),
                      out.data_ptr(), residual.data_ptr() if residual is not None else None,
                      ws.data_ptr(), cnt.data_ptr(), M, N, K, p["G"], nt, waves, ksplit,
-                     int(p["rms"]), int(p["swiglu"]), EPS, torch.cuda.current_stream().cuda_stream)
+                     int(p["rms"]), int(p["swiglu"]) | (2 if xdup else 0), EPS, torch.cuda.current_stream().cuda_stream)
     assert rc == 0, "no kernel instance for this configuration"
     return out
