@@ -62,6 +62,17 @@ class Lin:
         H.quant_fp8(x, xq, _SBUF[:M])
         self.mm_q(xq, out)
 
+    def norm_in(self, x, d, w, h, out):
+        """out = rmsnorm(x += d) @ W^T; h: bf16 scratch for the normed rows when not fp8."""
+        T = x.shape[0]
+        if self.fp8:
+            xq = _QBUF[: T * HIDDEN].view(T, HIDDEN)
+            H.add_rmsnorm_q(x, d, w, xq, _SBUF[:T])
+            self.mm_q(xq, out)
+        else:
+            H.add_rmsnorm(x, d, w, h)
+            self(h, out)
+
     def mm_q(self, xq, out):
         """xq: rows already quantized into _QBUF, scales in _SBUF."""
         torch._scaled_mm(xq, self.wq.t(), scale_a=_SBUF[:xq.shape[0]], scale_b=self.ws, out_dtype=torch.bfloat16,
@@ -96,16 +107,15 @@ class Prefill:
         self.pos = torch.zeros(1, dtype=torch.int32, device=dev)
         self.nrow = torch.zeros(1, dtype=torch.int32, device=dev)
 
-    def _attn(self, L, lin, li, st, p0, T):
-        lin["qkv"](self.h[:T], self.qkv[:T])
+    def _attn(self, L, lin, li, st, p0, T, d):
+        lin["qkv"].norm_in(self.x[:T], d, L["in_norm"], self.h[:T], self.qkv[:T])
         H.attn_prep(self.qkv[:T], L["q_norm"], L["k_norm"], self.pos, self.q[:T], st.k[li], st.v[li])
         gate = self.qkv[:T, :HEADS * 512].view(T, HEADS, 512)[..., HEAD_DIM:]
         attn_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM))
         lin["o"](self.ao[:T], self.d[:T])
 
     def _mlp(self, L, lin, T):
-        H.add_rmsnorm(self.x[:T], self.d[:T], L["post_norm"], self.h[:T])
-        lin["gate_up"](self.h[:T], self.gu[:T])
+        lin["gate_up"].norm_in(self.x[:T], self.d[:T], L["post_norm"], self.h[:T], self.gu[:T])
         if lin["down"].fp8:
             aq = _QBUF[: T * INTER].view(T, INTER)
             H.silu_mul_quant(self.gu[:T], aq, _SBUF[:T])
@@ -123,14 +133,14 @@ class Prefill:
         torch.index_select(w.embed, 0, ids, out=self.x[:T])
         ai = gi = 0
         for i, L in enumerate(w.layers):
-            H.add_rmsnorm(self.x[:T], None if i == 0 else self.d[:T], L["in_norm"], self.h[:T])
             lin = self.lin[i]
+            d = None if i == 0 else self.d[:T]
             if IS_ATTN[i]:
-                self._attn(L, lin, ai, st, p0, T)
+                self._attn(L, lin, ai, st, p0, T, d)
                 ai += 1
             else:
                 proj = self.proj[:T]
-                lin["in_proj"](self.h[:T], proj)
+                lin["in_proj"].norm_in(self.x[:T], d, L["in_norm"], self.h[:T], proj)
                 y = self.y[:T]
                 H.gdn_conv(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], y, self.gb[:T])
                 q = y[:, :2048].view(T, 16, 128)
@@ -158,8 +168,7 @@ class Prefill:
         H.add_rmsnorm(self.h[:T], None, M["pre_emb"], self.mx[:T, :HIDDEN])
         H.add_rmsnorm(hn, None, M["pre_hid"], self.mx[:T, HIDDEN:])
         self.mlin["fc"](self.mx[:T], self.x[:T])
-        H.add_rmsnorm(self.x[:T], None, M["in_norm"], self.h[:T])
-        self._attn(M, self.mlin, 16, st, p0, T)
+        self._attn(M, self.mlin, 16, st, p0, T, None)
         self._mlp(M, self.mlin, T)
         out = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=hn.device)
         H.add_rmsnorm(self.x[T - 1:T], self.d[T - 1:T], M["norm"], out)

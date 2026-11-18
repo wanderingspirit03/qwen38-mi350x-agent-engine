@@ -184,7 +184,56 @@ __global__ __launch_bounds__(512) void silu_mul_quant_kernel(const bf16* __restr
   }
 }
 
+// add_rmsnorm with the normed row quantized to fp8 (as quant_fp8): q (R, H) e4m3, sc (R) row scales.
+__global__ __launch_bounds__(256) void add_rmsnorm_q_kernel(bf16* __restrict__ x, const bf16* __restrict__ d,
+                                                            const bf16* __restrict__ w,
+                                                            __hip_fp8_storage_t* __restrict__ q,
+                                                            float* __restrict__ sc, int H) {
+  __shared__ float red[4];
+  __shared__ float redm[4];
+  int r = blockIdx.x;
+  x += (size_t)r * H;
+  float v[20];
+  float s = 0.f;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    float a = 0.f;
+    if (i < H) {
+      a = bf(x[i]);
+      if (d) {
+        a = rbf(a + bf(d[(size_t)r * H + i]));
+        x[i] = __float2bfloat16(a);
+      }
+    }
+    v[j] = a;
+    s += a * a;
+  }
+  float tot = block_sum<256>(s, red);
+  float rs = rsqrtf(tot / H + 1e-6f);
+  float m = 0.f;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    v[j] = i < H ? rbf(v[j] * rs * (1.f + bf(w[i]))) : 0.f;
+    m = fmaxf(m, fabsf(v[j]));
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) redm[threadIdx.x >> 6] = m;
+  __syncthreads();
+  m = fmaxf(fmaxf(redm[0], redm[1]), fmaxf(redm[2], redm[3]));
+  float sv = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / sv;
+  if (threadIdx.x == 0) sc[r] = sv;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    if (i < H) q[(size_t)r * H + i] = __hip_cvt_float_to_fp8(v[j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+  }
+}
+
 extern "C" {
+int add_rmsnorm_q(int R, int H, void* x, const void* d, const void* w, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(add_rmsnorm_q_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
+                     (__hip_fp8_storage_t*)q, (float*)sc, H);
+  return (int)hipGetLastError();
+}
 int silu_mul_quant(int R, int I, const void* gu, void* q, void* sc, hipStream_t s) {
   hipLaunchKernelGGL(silu_mul_quant_kernel, dim3(R), dim3(512), 0, s, (const bf16*)gu, I, (__hip_fp8_storage_t*)q,
                      (float*)sc);

@@ -124,3 +124,13 @@ def silu_mul_quant(gu, q, sc):
     """gu (R, 2I) bf16 contiguous -> q (R, I) fp8 = silu(gate) * up quantized per row, sc (R, 1) fp32."""
     assert gu.is_contiguous() and q.is_contiguous()
     _check(lib.silu_mul_quant(gu.shape[0], gu.shape[1] // 2, p(gu), p(q), p(sc), stream()), "silu_mul_quant")
+
+
+lib.add_rmsnorm_q.argtypes = [I, I, P, P, P, P, P, P]
+
+
+def add_rmsnorm_q(x, d, w, q, sc):
+    """add_rmsnorm with the output quantized: x (R, H) contiguous; q (R, H) fp8, sc (R, 1) fp32."""
+    assert x.is_contiguous() and q.is_contiguous() and (d is None or d.is_contiguous())
+    _check(lib.add_rmsnorm_q(x.shape[0], x.shape[1], p(x), P(0) if d is None else p(d), p(w), p(q), p(sc),
+                             stream()), "add_rmsnorm_q")
