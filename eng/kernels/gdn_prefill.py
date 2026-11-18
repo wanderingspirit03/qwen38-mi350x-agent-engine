@@ -31,13 +31,11 @@ D = 128
 HK = 16
 HV = 48
 WY_WARPS = 1
-SCAN_DBG = 0
-SCAN_TDBG = None
-OUT_WARPS = 4
+SCAN_NW = 2   # waves per scan workgroup (8 / SCAN_NW workgroups per head); 2 measured fastest
 
 _lib = _H.lib
-_lib.gdn_scan.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 6 + [ctypes.c_long] * 3 + [ctypes.c_void_p] * 2 + [ctypes.c_int] * 2 \
-    + [ctypes.c_void_p]
+_lib.gdn_scan.argtypes = ([ctypes.c_int] + [ctypes.c_void_p] * 7 + [ctypes.c_long] * 3 + [ctypes.c_void_p, ctypes.c_long]
+                          + [ctypes.c_int] * 3 + [ctypes.c_void_p])
 
 
 @triton.jit
@@ -66,17 +64,31 @@ def _ld(x, r, m, col, sx, D: tl.constexpr):
 
 
 @triton.jit
-def _qk_block(q, k, qn_out, kn_out, r, m, hk, sq, sk, scale, STORE: tl.constexpr, D: tl.constexpr, HK: tl.constexpr):
-    """Normalized k rows (bf16); the h % 3 == 0 programs also store normalized q and k for the output kernel."""
+def _qk_block(q, k, qn_out, r, m, hk, sq, sk, scale, STORE: tl.constexpr, D: tl.constexpr, HK: tl.constexpr):
+    """Normalized k and q rows (bf16, q scaled); the h % 3 == 0 programs store q for the scan."""
     d = tl.arange(0, D)
     kf = _ld(k, r, m, hk * D, sk, D)
     kf = kf * tl.rsqrt(tl.sum(kf * kf, 1) + 1e-6)[:, None]
+    qf = _ld(q, r, m, hk * D, sq, D)
+    qf = (qf * (tl.rsqrt(tl.sum(qf * qf, 1) + 1e-6) * scale)[:, None]).to(tl.bfloat16)
     if STORE:
-        tl.store(kn_out + r[:, None] * (HK * D) + hk * D + d[None, :], kf.to(tl.bfloat16))
-        qf = _ld(q, r, m, hk * D, sq, D)
-        qf = qf * (tl.rsqrt(tl.sum(qf * qf, 1) + 1e-6) * scale)[:, None]
-        tl.store(qn_out + r[:, None] * (HK * D) + hk * D + d[None, :], qf.to(tl.bfloat16))
-    return kf.to(tl.bfloat16)
+        tl.store(qn_out + r[:, None] * (HK * D) + hk * D + d[None, :], qf)
+    return kf.to(tl.bfloat16), qf
+
+
+@triton.jit
+def _store_M(p, qa, kb, Ga, Gb, NZ: tl.constexpr, DIAG: tl.constexpr):
+    """One 16x16 block of M: q_a k_b^T exp(G_a - G_b), lower triangle incl. the diagonal if DIAG, zero if not NZ."""
+    if NZ:
+        x = tl.dot(qa, tl.trans(kb))
+        li = tl.arange(0, 16)
+        if DIAG:
+            x = x * tl.exp(tl.where(li[:, None] >= li[None, :], Ga[:, None] - Gb[None, :], float("-inf")))
+        else:
+            x = x * tl.exp(Ga[:, None] - Gb[None, :])
+        tl.store(p, x.to(tl.bfloat16))
+    else:
+        tl.store(p, tl.zeros((16, 16), dtype=tl.bfloat16))
 
 
 @triton.jit
@@ -114,7 +126,7 @@ def _store_T(p, li, x, D: tl.constexpr):
 
 
 @triton.jit
-def _wy_kernel(q, k, v, g, beta, w_out, uT_out, kdT_out, G_out, qn_out, kn_out,
+def _wy_kernel(q, k, v, g, beta, w_out, uT_out, kdT_out, G_out, qn_out, M_out,
                T, Tp, sq, sk, sv, sg, sb, scale, D: tl.constexpr, HK: tl.constexpr, HV: tl.constexpr):
     c = tl.program_id(0)
     h = tl.program_id(1)
@@ -130,10 +142,10 @@ def _wy_kernel(q, k, v, g, beta, w_out, uT_out, kdT_out, G_out, qn_out, kn_out,
     m1 = r1 < T
     m2 = r2 < T
     m3 = r3 < T
-    k0 = _qk_block(q, k, qn_out, kn_out, r0, m0, hk, sq, sk, scale, STORE_QK, D, HK)
-    k1 = _qk_block(q, k, qn_out, kn_out, r1, m1, hk, sq, sk, scale, STORE_QK, D, HK)
-    k2 = _qk_block(q, k, qn_out, kn_out, r2, m2, hk, sq, sk, scale, STORE_QK, D, HK)
-    k3 = _qk_block(q, k, qn_out, kn_out, r3, m3, hk, sq, sk, scale, STORE_QK, D, HK)
+    k0, q0 = _qk_block(q, k, qn_out, r0, m0, hk, sq, sk, scale, STORE_QK, D, HK)
+    k1, q1 = _qk_block(q, k, qn_out, r1, m1, hk, sq, sk, scale, STORE_QK, D, HK)
+    k2, q2 = _qk_block(q, k, qn_out, r2, m2, hk, sq, sk, scale, STORE_QK, D, HK)
+    k3, q3 = _qk_block(q, k, qn_out, r3, m3, hk, sq, sk, scale, STORE_QK, D, HK)
 
     g0 = tl.load(g + r0 * sg + h, mask=m0, other=0.)
     b0 = tl.load(beta + r0 * sb + h, mask=m0, other=0.)
@@ -162,6 +174,25 @@ def _wy_kernel(q, k, v, g, beta, w_out, uT_out, kdT_out, G_out, qn_out, kn_out,
     A30 = _block_A(k3, k0, b3, G3, G0, False)
     A31 = _block_A(k3, k1, b3, G3, G1, False)
     A32 = _block_A(k3, k2, b3, G3, G2, False)
+    # M = q k^T exp(G_i - G_j) for j <= i (zero above), for the output in the scan
+    mp = M_out + (c * HV + h) * 4096 + li[:, None] * 64 + li[None, :]
+    _store_M(mp, q0, k0, G0, G0, True, True)
+    _store_M(mp + 16, q0, k0, G0, G0, False, False)
+    _store_M(mp + 32, q0, k0, G0, G0, False, False)
+    _store_M(mp + 48, q0, k0, G0, G0, False, False)
+    _store_M(mp + 16 * 64, q1, k0, G1, G0, True, False)
+    _store_M(mp + 16 * 64 + 16, q1, k1, G1, G1, True, True)
+    _store_M(mp + 16 * 64 + 32, q1, k1, G1, G1, False, False)
+    _store_M(mp + 16 * 64 + 48, q1, k1, G1, G1, False, False)
+    _store_M(mp + 32 * 64, q2, k0, G2, G0, True, False)
+    _store_M(mp + 32 * 64 + 16, q2, k1, G2, G1, True, False)
+    _store_M(mp + 32 * 64 + 32, q2, k2, G2, G2, True, True)
+    _store_M(mp + 32 * 64 + 48, q2, k2, G2, G2, False, False)
+    _store_M(mp + 48 * 64, q3, k0, G3, G0, True, False)
+    _store_M(mp + 48 * 64 + 16, q3, k1, G3, G1, True, False)
+    _store_M(mp + 48 * 64 + 32, q3, k2, G3, G2, True, False)
+    _store_M(mp + 48 * 64 + 48, q3, k3, G3, G3, True, True)
+
     T00 = _inv16(_block_A(k0, k0, b0, G0, G0, True))
     T11 = _inv16(_block_A(k1, k1, b1, G1, G1, True))
     T22 = _inv16(_block_A(k2, k2, b2, G2, G2, True))
@@ -199,33 +230,17 @@ def _wy_kernel(q, k, v, g, beta, w_out, uT_out, kdT_out, G_out, qn_out, kn_out,
 
 
 @triton.jit
-def _out_kernel(q, k, G, hT, vnT, z, gw, o,
-                T, Tp, sq, sk, sz, so,
-                GATED: tl.constexpr, D: tl.constexpr, HV: tl.constexpr):
-    c = tl.program_id(0)
+def _gated_norm_kernel(o, z, gw, out, T, sz, so, BT: tl.constexpr, D: tl.constexpr, HV: tl.constexpr):
+    """out = rmsnorm_gated(o, z, gw) for BT rows of one head (as eng.hip.gated_norm)."""
     h = tl.program_id(1)
-    hk = h // 3
-    li = tl.arange(0, 64)
+    r = tl.program_id(0) * BT + tl.arange(0, BT)
     d = tl.arange(0, D)
-    r = c * 64 + li
-    m = r < T
-    qt = tl.load(q + r[:, None] * sq + hk * D + d[None, :])
-    kt = tl.load(k + r[:, None] * sk + hk * D + d[None, :])
-    Gt = tl.load(G + h * Tp + r)
-    att = tl.dot(qt, tl.trans(kt))
-    att = att * tl.exp(tl.where(li[:, None] >= li[None, :], Gt[:, None] - Gt[None, :], float("-inf")))
-    base = (c * HV + h) * D
-    ht = tl.load(hT + (base + d[None, :]) * D + d[:, None])          # [k, v]
-    vt = tl.load(vnT + (base + d[None, :]) * 64 + li[:, None])       # [t, v]
-    qg = (qt.to(tl.float32) * tl.exp(Gt)[:, None]).to(tl.bfloat16)
-    ot = tl.dot(qg, ht) + tl.dot(att.to(tl.bfloat16), vt)
-    if GATED:
-        x = ot.to(tl.bfloat16).to(tl.float32)
-        x = x * tl.rsqrt(tl.sum(x * x, 1) / D + 1e-6)[:, None]
-        x = (x.to(tl.bfloat16) * tl.load(gw + d)[None, :]).to(tl.float32)
-        zz = tl.load(z + r[:, None] * sz + h * D + d[None, :], mask=m[:, None], other=0.).to(tl.float32)
-        ot = x * (zz / (1. + tl.exp(-zz)))
-    tl.store(o + r[:, None] * so + h * D + d[None, :], ot.to(o.dtype.element_ty), mask=m[:, None])
+    m = (r < T)[:, None]
+    x = tl.load(o + r[:, None] * (HV * D) + h * D + d[None, :], mask=m, other=0.).to(tl.float32)
+    x = x * tl.rsqrt(tl.sum(x * x, 1) / D + 1e-6)[:, None]
+    x = (x.to(tl.bfloat16) * tl.load(gw + d)[None, :]).to(tl.float32)
+    zz = tl.load(z + r[:, None] * sz + h * D + d[None, :], mask=m, other=0.).to(tl.float32)
+    tl.store(out + r[:, None] * so + h * D + d[None, :], (x * (zz / (1. + tl.exp(-zz)))).to(tl.bfloat16), mask=m)
 
 
 def gdn_prefill(q, k, v, g, beta, state, state_kv=False, out=None, z=None, gw=None):
@@ -253,18 +268,17 @@ def gdn_prefill(q, k, v, g, beta, state, state_kv=False, out=None, z=None, gw=No
     kdT = torch.empty(NC, HV, D, C, device=dev, dtype=bf)
     G = torch.empty(HV, Tp, device=dev, dtype=torch.float32)
     qn = torch.empty(Tp, HK, D, device=dev, dtype=bf)
-    kn = torch.empty(Tp, HK, D, device=dev, dtype=bf)
-    _wy_kernel[(NC, HV)](q, k, v, g, beta, w, uT, kdT, G, qn, kn,
+    M = torch.empty(NC, HV, C, C, device=dev, dtype=bf)
+    _wy_kernel[(NC, HV)](q, k, v, g, beta, w, uT, kdT, G, qn, M,
                          T, Tp, q.stride(0), k.stride(0), v.stride(0), g.stride(0), beta.stride(0), D ** -0.5,
                          D=D, HK=HK, HV=HV, num_warps=WY_WARPS)
-    hT = torch.empty(NC, HV, D, D, device=dev, dtype=bf)
-    vnT = torch.empty(NC, HV, D, C, device=dev, dtype=bf)
-    rc = _lib.gdn_scan(SCAN_DBG, None if SCAN_TDBG is None else SCAN_TDBG.data_ptr(), w.data_ptr(), uT.data_ptr(),
-                       kdT.data_ptr(), G.data_ptr(), state.data_ptr(), state.stride(0), s_k, s_v,
-                       hT.data_ptr(), vnT.data_ptr(), NC, Tp, torch.cuda.current_stream().cuda_stream)
+    o = torch.empty(T, HV * D, device=dev, dtype=bf) if gated else out
+    rc = _lib.gdn_scan(SCAN_NW, w.data_ptr(), uT.data_ptr(), kdT.data_ptr(), qn.data_ptr(), M.data_ptr(),
+                       G.data_ptr(), state.data_ptr(), state.stride(0), s_k, s_v, o.data_ptr(), o.stride(0), T, NC, Tp,
+                       torch.cuda.current_stream().cuda_stream)
     if rc:
         raise RuntimeError(f"gdn_scan: hip error {rc}")
-    _out_kernel[(NC, HV)](qn, kn, G, hT, vnT, z if gated else qn, gw if gated else qn, out,
-                          T, Tp, HK * D, HK * D, z.stride(0) if gated else 0, out.stride(0),
-                          GATED=gated, D=D, HV=HV, num_warps=OUT_WARPS)
+    if gated:
+        _gated_norm_kernel[(triton.cdiv(T, 32), HV)](o, z, gw, out, T, z.stride(0), out.stride(0),
+                                                     BT=32, D=D, HV=HV, num_warps=4)
     return out

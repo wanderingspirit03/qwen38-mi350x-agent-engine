@@ -1,5 +1,5 @@
 """Test + benchmark for eng.kernels.gdn_prefill.
-  python3 -m eng.kernels.test_gdn_prefill [--quick] [--prof] [--dbg (scan without stores)] [--stamp (scan step timestamps)]"""
+  python3 -m eng.kernels.test_gdn_prefill [--quick] [--prof]"""
 import sys
 import torch
 import torch.nn.functional as F
@@ -157,27 +157,15 @@ if __name__ == "__main__":
         check()
         check_proj()
     bench()
-    import eng.kernels.gdn_prefill as M
-    if "--stamp" in sys.argv:
-        M.SCAN_TDBG = torch.zeros(96 * 64 * 4, dtype=torch.int64, device="cuda")
-        M.SCAN_DBG = 2
-        kernel_times(4096)
-        M.SCAN_DBG = 0
-        x = M.SCAN_TDBG.view(96, 64, 4)[:, 0:64:2].double()
-        x = x - x[:, :1, :1]
-        for hh in (0, 17):
-            print("head", hh, "per 2 chunks: t0 (cycles), sync wait, compute, uload+lstore")
-            for c in range(0, 32, 4):
-                a = x[hh, c]
-                print(f"  c={2 * c}: start {a[0]:.0f}  barrier {a[1] - a[0]:.0f}  compute {a[2] - a[1]:.0f}  lstore {a[3] - a[2]:.0f}  "
-                      f"next start {x[hh, c + 1, 0] - a[0]:.0f}")
-        M.SCAN_TDBG = None
-    if "--dbg" in sys.argv:
-        for dbg in (0, 1):
-            M.SCAN_DBG = dbg
-            print("DBG", dbg)
-            kernel_times(4096)
-        M.SCAN_DBG = 0
+    if "--nw" in sys.argv:
+        import eng.kernels.gdn_prefill as M
+        for nw in (4, 8, 2):
+            M.SCAN_NW = nw
+            print("SCAN_NW", nw)
+            check_proj((37, 1000))
+            for T in (420, 1000, 4096):
+                kernel_times(T)
+        M.SCAN_NW = 2
     if "--prof" in sys.argv:
         for T in (420, 1000, 4096, 5600):
             kernel_times(T)
