@@ -36,6 +36,10 @@ FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
 
+_QBUF = torch.empty(4096 * 17408, dtype=FP8, device="cuda")      # activations of one chunk, quantized
+_SBUF = torch.empty(4096, 1, dtype=torch.float32, device="cuda")
+
+
 class Lin:
     """A prefill linear layer: bf16 matmul, or fp8 (per-output-channel weight scales, per-row activation scales)."""
 
@@ -52,9 +56,11 @@ class Lin:
         if not self.fp8:
             torch.matmul(x, self.w.t(), out=out)
             return
-        xs = x.float().abs().amax(1, keepdim=True).clamp(min=1e-8) / FP8_MAX
-        xq = (x.float() / xs).to(FP8)
-        out.copy_(torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.ws, out_dtype=torch.bfloat16))
+        M, K = x.shape
+        xq = _QBUF[: M * K].view(M, K)
+        xs = _SBUF[:M]
+        H.quant_fp8(x, xq, xs)
+        torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.ws, out_dtype=torch.bfloat16, out=out)
 
 
 class Prefill:

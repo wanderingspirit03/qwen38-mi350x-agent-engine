@@ -106,7 +106,44 @@ __global__ void gate_mul_kernel(bf16* __restrict__ o, const bf16* __restrict__ q
   o[idx] = __float2bfloat16(bf(o[idx]) * (1.f / (1.f + __expf(-g))));
 }
 
+// Row-wise fp8 (e4m3fn) quantization: q = x / s, s = amax(row) / 448. grid R, block 256.
+#include <hip/hip_fp8.h>
+__global__ __launch_bounds__(256) void quant_fp8_kernel(const bf16* __restrict__ x, int K, int xs,
+                                                        __hip_fp8_storage_t* __restrict__ q, float* __restrict__ sc) {
+  __shared__ float red[4];
+  int r = blockIdx.x;
+  const bf16* xr = x + (size_t)r * xs;
+  float m = 0.f;
+  for (int i = threadIdx.x * 8; i < K; i += 256 * 8) {
+    uint4 u = *reinterpret_cast<const uint4*>(xr + i);
+    const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+    for (int j = 0; j < 8; j++) m = fmaxf(m, fabsf(bf(e[j])));
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) red[threadIdx.x >> 6] = m;
+  __syncthreads();
+  m = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+  float s = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / s;
+  if (threadIdx.x == 0) sc[r] = s;
+  __hip_fp8_storage_t* qr = q + (size_t)r * K;
+  for (int i = threadIdx.x * 8; i < K; i += 256 * 8) {
+    uint4 u = *reinterpret_cast<const uint4*>(xr + i);
+    const bf16* e = reinterpret_cast<const bf16*>(&u);
+    uint2 o;
+    __hip_fp8_storage_t* ob = reinterpret_cast<__hip_fp8_storage_t*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; j++) ob[j] = __hip_cvt_float_to_fp8(bf(e[j]) * inv, __HIP_SATFINITE, __HIP_E4M3);
+    *reinterpret_cast<uint2*>(qr + i) = o;
+  }
+}
+
 extern "C" {
+int quant_fp8(int R, int K, const void* x, int xs, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(quant_fp8_kernel, dim3(R), dim3(256), 0, s, (const bf16*)x, K, xs, (__hip_fp8_storage_t*)q,
+                     (float*)sc);
+  return (int)hipGetLastError();
+}
 int add_rmsnorm(int R, int H, void* x, const void* d, const void* w, void* out, int xs, int os, hipStream_t s) {
   hipLaunchKernelGGL(add_rmsnorm_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
                      (bf16*)out, H, xs, os);

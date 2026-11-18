@@ -92,3 +92,12 @@ def gated_norm(o, proj, gw, out):
 def conv_update(n_dev, proj, hist):
     """hist (3, 10240) <- rows n, n+1, n+2 of [hist; proj rows] (n = n_dev[0] = number of proj rows)."""
     _check(lib.conv_update(p(n_dev), p(proj), proj.stride(0), p(hist), stream()), "conv_update")
+
+
+lib.quant_fp8.argtypes = [I, I, P, I, P, P, P]
+
+
+def quant_fp8(x, q, sc):
+    """x (R, K) bf16 (K % 8 == 0, rows may be strided) -> q (R, K) float8_e4m3fn, sc (R, 1) fp32 row scales."""
+    assert x.stride(1) == 1 and x.shape[1] % 8 == 0 and q.is_contiguous()
+    _check(lib.quant_fp8(x.shape[0], x.shape[1], p(x), x.stride(0), p(q), p(sc), stream()), "quant_fp8")
