@@ -116,10 +116,10 @@ class Fast:
         self.y = torch.zeros(R, dtype=torch.long, device=dev)
         self.n_acc = torch.ones(1, **i32)
         self.new = torch.zeros(R, dtype=torch.long, device=dev)  # the round's new tokens (first n_acc valid)
-        self.mpos = torch.zeros(1, **i32)
-        self.nkv = torch.zeros(1, **i32)
+        self.pick = torch.zeros(1, dtype=torch.long, device=dev)
+        # positions derived from pos (see accept_kernel): [catch-up pos, its keys, verify keys, (chain pos, keys)...]
+        self.P = torch.zeros(3 + 2 * K, **i32)
         self.res = torch.zeros(R + 1, dtype=torch.long, device=dev)   # [n_acc, new tokens...]
-        self.ar = torch.arange(R, device=dev)
         self.zero = torch.zeros(1, dtype=torch.long, device=dev)
 
     # ---- the target model on R rows ----
@@ -146,7 +146,7 @@ class Fast:
         for i, L in enumerate(w.layers):
             lin = self.lin[i]
             if IS_ATTN[i]:
-                self.attn(lin, L, ai, st, self.pos, R)
+                self.attn(lin, L, ai, st, self.pos, self.P[2:3], R)
                 ai += 1
             else:
                 proj = self.proj[gi]
@@ -161,34 +161,34 @@ class Fast:
         self.head(self.hn, self.logits)
         H.argmax_rows(self.logits, self.y)
 
-    def attn(self, lin, L, li, st, pos, R):
+    def set_pos(self, n):
+        """Start of decoding at position n (eager)."""
+        self.pos.fill_(n)
+        self.P[2] = n + self.R
+        self.P[3::2] = torch.arange(n, n + self.K, dtype=torch.int32)
+        self.P[4::2] = torch.arange(n + 1, n + self.K + 1, dtype=torch.int32)
+
+    def attn(self, lin, L, li, st, pos, nkv, R):
         lin["qkv"](self.x[:R], self.qkv[:R])
         H.attn_prep(self.qkv[:R], L["q_norm"], L["k_norm"], pos, self.q[:R], st.k[li], st.v[li])
-        torch.add(pos, R, out=self.nkv)
         gate = self.qkv[:R, :HEADS * 512].view(R, HEADS, 512)[..., HEAD_DIM:]
-        attn_decode(self.q[:R], st.k[li], st.v[li], self.nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM))
+        attn_decode(self.q[:R], st.k[li], st.v[li], nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM))
         lin["o"](self.ao[:R], self.x[:R], add=True)
 
     # ---- acceptance and commit ----
     def accept(self, st):
-        K = self.K
-        match = (self.vt[1:] == self.y[:K]).int()
-        a = torch.cumprod(match, 0).sum()
-        self.n_acc.copy_((a + 1).view(1))
-        # new tokens: d_1..d_a, then y_a
-        ya = self.y.gather(0, a.view(1))
-        self.new.copy_(torch.where(self.ar < a, torch.cat([self.vt[1:], self.vt[:1]]), ya))
+        H.accept(self.vt, self.y, self.n_acc, self.new, self.res, self.pick, self.pos, self.P)
         H.gdn_commit(self.n_acc, self.qk, self.vv, self.gb, st.ssm, self.proj, st.conv)
 
     # ---- MTP ----
-    def mtp(self, st, tokens, hidden, pos, rows, pick, out):
+    def mtp(self, st, tokens, hidden, pos, nkv, rows, pick, out):
         """The MTP layer on `rows` rows at positions pos.. (row i: target-side hidden at pos+i and the token at
         pos+i+1). Writes the draft (argmax of row `pick`) to out (1,) and leaves that row's normed hidden
         in self.mhn[:1]."""
         w, M, R = self.w, self.w.mtp, rows
         H.mtp_in(tokens, w.embed, hidden, M["pre_emb"], M["pre_hid"], self.mx[:R])
         self.mlin["fc"](self.mx[:R], self.x[:R])
-        self.attn(self.mlin, M, 16, st, pos, R)
+        self.attn(self.mlin, M, 16, st, pos, nkv, R)
         self.mlp(self.mlin, R)
         if R == 1:
             H.add_rmsnorm(self.x[:1], None, M["norm"], self.mhn[:1])
@@ -201,18 +201,14 @@ class Fast:
     def draft_chain(self, st):
         """vt[1] holds d_1: fill vt[2:] with K - 1 chained MTP drafts (position of x is self.pos)."""
         for j in range(1, self.K):
-            torch.add(self.pos, j - 1, out=self.mpos)
-            self.mtp(st, self.vt[j:j + 1], self.mhn[:1], self.mpos, 1, self.zero, self.vt[j + 1:j + 2])
+            P = self.P[3 + 2 * (j - 1):]
+            self.mtp(st, self.vt[j:j + 1], self.mhn[:1], P[0:1], P[1:2], 1, self.zero, self.vt[j + 1:j + 2])
 
     def round(self, st):
         self.verify(st)
         self.accept(st)
         # catch-up: rows i = 0..K: hidden at pos+i, token new[i] at pos+i+1; row a = n_acc - 1 gives d_1
-        self.mtp(st, self.new, self.hn, self.pos, self.R, self.n_acc.long() - 1, self.vt[1:2])
-        self.vt[0:1].copy_(self.new.gather(0, self.n_acc.long() - 1))
-        self.res[0:1].copy_(self.n_acc)
-        self.res[1:].copy_(self.new)
-        self.pos.add_(self.n_acc)
+        self.mtp(st, self.new, self.hn, self.P[0:1], self.P[1:2], self.R, self.pick, self.vt[1:2])
         self.draft_chain(st)
 
     def capture(self, st):

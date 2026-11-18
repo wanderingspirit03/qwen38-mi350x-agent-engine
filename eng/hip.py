@@ -161,3 +161,11 @@ def mtp_in(tok, embed, hid, we, wh, mx):
     R, Hd = hid.shape
     assert tok.dtype == torch.int64 and hid.stride(1) == 1 and mx.is_contiguous()
     _check(lib.mtp_in(R, Hd, p(tok), p(embed), p(hid), hid.stride(0), p(we), p(wh), p(mx), stream()), "mtp_in")
+
+
+lib.accept.argtypes = [I, P, P, P, P, P, P, P, P, P]
+
+
+def accept(vt, y, n_acc, new, res, pick, pos, P_):
+    """One round's acceptance and position bookkeeping (see accept_kernel in small.hip)."""
+    _check(lib.accept(vt.shape[0], p(vt), p(y), p(n_acc), p(new), p(res), p(pick), p(pos), p(P_), stream()), "accept")

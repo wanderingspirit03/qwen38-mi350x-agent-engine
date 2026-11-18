@@ -87,7 +87,7 @@ class Engine:
 
     def _decode(self, x, n, ml, mh, max_tokens):
         F, st = self.fast, self.st
-        F.pos.fill_(n)
+        F.set_pos(n)
         F.vt[0] = x
         F.mhn[:1].copy_(mh)
         F.vt[1:2].copy_(ml.argmax(-1))

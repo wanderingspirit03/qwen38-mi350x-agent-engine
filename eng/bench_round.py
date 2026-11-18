@@ -42,23 +42,23 @@ def main():
     parts = {
         "verify": lambda: F.verify(st),
         "accept+commit": lambda: F.accept(st),
-        "mtp catch-up": lambda: F.mtp(st, F.new, F.hn, F.pos, F.R, F.zero, F.vt[1:2]),
-        "mtp 1 row": lambda: F.mtp(st, F.vt[:1], F.mhn[:1], F.mpos, 1, F.zero, F.vt[1:2]),
+        "mtp catch-up": lambda: F.mtp(st, F.new, F.hn, F.P[0:1], F.P[1:2], F.R, F.zero, F.vt[1:2]),
+        "mtp 1 row": lambda: F.mtp(st, F.vt[:1], F.mhn[:1], F.P[3:4], F.P[4:5], 1, F.zero, F.vt[1:2]),
     }
     for name, fn in parts.items():
-        F.pos.fill_(N)
-        F.mpos.fill_(N)
+        F.set_pos(N)
+        F.P[:2] = N
         F.n_acc.fill_(K + 1)
         g = graph(fn)
-        F.pos.fill_(N)
+        F.set_pos(N)
         print(f"{name}: {tm(g.replay):.3f} ms", flush=True)
     F.capture(st)
     def rnd():
-        F.pos.fill_(N)
+        F.set_pos(N)
         F.g_round.replay()
     print(f"whole round (K={K}): {tm(rnd):.3f} ms", flush=True)
     from torch.profiler import ProfilerActivity, profile
-    F.pos.fill_(N)
+    F.set_pos(N)
     what = os.environ.get("BENCH_PROF", "round")
     fn = {"round": lambda: F.round(st), "chain": lambda: F.draft_chain(st)}[what]
     with profile(activities=[ProfilerActivity.CUDA]) as prof:

@@ -301,7 +301,48 @@ __global__ __launch_bounds__(256) void mtp_in_kernel(const long long* __restrict
   }
 }
 
+// Acceptance of one speculative round and the position bookkeeping (one block of 64 threads).
+// vt (R) = [x, d_1..d_K], y (R) target argmax per row. a = leading matches d_{i+1} == y_i; n = a + 1.
+// new[i] = d_{i+1} for i < a, else y_a; res = [n, new...]; vt[0] = y_a; pick = a.
+// pos (position of x) advances by n. P (int32): [0] old pos (catch-up), [1] old pos + R (catch-up keys),
+// [2] new pos + R (next verify keys), [3 + 2j] new pos + j, [4 + 2j] new pos + j + 1 (chain step j = 0..K-2).
+__global__ void accept_kernel(int R, long long* __restrict__ vt, const long long* __restrict__ y,
+                              int* __restrict__ n_acc, long long* __restrict__ nw, long long* __restrict__ res,
+                              long long* __restrict__ pick, int* __restrict__ pos, int* __restrict__ P) {
+  __shared__ int sa;
+  int i = threadIdx.x, K = R - 1;
+  bool mis = i < K && vt[1 + i] != y[i];
+  unsigned long long b = __ballot(mis);
+  if (i == 0) sa = b ? __ffsll((long long)b) - 1 : K;
+  __syncthreads();
+  int a = sa;
+  long long ya = y[a];
+  long long d = i < K ? vt[1 + i] : 0;
+  __syncthreads();
+  if (i < R) {
+    long long t = i < a ? d : ya;
+    nw[i] = t;
+    res[1 + i] = t;
+  }
+  if (i == 0) {
+    int p = pos[0], n = a + 1, q = p + n;
+    n_acc[0] = n;
+    res[0] = n;
+    pick[0] = a;
+    vt[0] = ya;
+    pos[0] = q;
+    P[0] = p; P[1] = p + R; P[2] = q + R;
+    for (int j = 0; j < K - 1; j++) { P[3 + 2 * j] = q + j; P[4 + 2 * j] = q + j + 1; }
+  }
+}
+
 extern "C" {
+int accept(int R, void* vt, const void* y, void* n_acc, void* nw, void* res, void* pick, void* pos, void* P,
+           hipStream_t s) {
+  hipLaunchKernelGGL(accept_kernel, dim3(1), dim3(64), 0, s, R, (long long*)vt, (const long long*)y, (int*)n_acc,
+                     (long long*)nw, (long long*)res, (long long*)pick, (int*)pos, (int*)P);
+  return (int)hipGetLastError();
+}
 int mtp_in(int R, int H, const void* tok, const void* embed, const void* hid, int hs, const void* we, const void* wh,
            void* mx, hipStream_t s) {
   hipLaunchKernelGGL(mtp_in_kernel, dim3(R, 2), dim3(256), 0, s, (const long long*)tok, (const bf16*)embed,
