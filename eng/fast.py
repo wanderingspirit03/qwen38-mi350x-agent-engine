@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from . import hip as H
+from .kernels.attention import attn_decode
 from .model import (CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, N_LAYERS, V_DIM, VOCAB)
 
 PROJ = CONV_DIM + V_DIM + 96
@@ -52,10 +53,9 @@ def attn_decode_ref(q, kc, vc, pos_dev, R):
 
 
 class Fast:
-    def __init__(self, w, K, dev="cuda", attn_decode=attn_decode_ref):
+    def __init__(self, w, K, dev="cuda"):
         self.w, self.K, self.R = w, K, K + 1
         R = self.R
-        self.attn_decode = attn_decode
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.lin = []
         for i, L in enumerate(w.layers):
@@ -102,6 +102,8 @@ class Fast:
         self.n_acc = torch.ones(1, **i32)
         self.new = torch.zeros(R, dtype=torch.long, device=dev)  # the round's new tokens (first n_acc valid)
         self.mpos = torch.zeros(1, **i32)
+        self.nkv = torch.zeros(1, **i32)
+        self.res = torch.zeros(R + 1, dtype=torch.long, device=dev)   # [n_acc, new tokens...]
         self.ar = torch.arange(R, device=dev)
         self.zero = torch.zeros(1, dtype=torch.long, device=dev)
 
@@ -141,9 +143,9 @@ class Fast:
     def attn(self, lin, L, li, st, pos, R):
         lin["qkv"](self.h[:R], self.qkv[:R])
         H.attn_prep(self.qkv[:R], L["q_norm"], L["k_norm"], pos, self.q[:R], st.k[li], st.v[li])
-        o = self.attn_decode(self.q[:R], st.k[li], st.v[li], pos, R)
-        self.ao[:R].copy_(o)
-        H.gate_mul(self.ao[:R], self.qkv[:R])
+        torch.add(pos, R, out=self.nkv)
+        gate = self.qkv[:R, :HEADS * 512].view(R, HEADS, 512)[..., HEAD_DIM:]
+        attn_decode(self.q[:R], st.k[li], st.v[li], self.nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM))
         lin["o"](self.ao[:R], self.d[:R])
 
     # ---- acceptance and commit ----
@@ -176,9 +178,8 @@ class Fast:
         self.head(self.mhn[:1], self.mlogit)
         return torch.argmax(self.mlogit, -1)
 
-    def draft_chain(self, st, d1):
-        """Fill vt[1:] with d1 and K - 1 chained MTP drafts (position of x is self.pos)."""
-        self.vt[1:2].copy_(d1)
+    def draft_chain(self, st):
+        """vt[1] holds d_1: fill vt[2:] with K - 1 chained MTP drafts (position of x is self.pos)."""
         for j in range(1, self.K):
             self.mpos.copy_(self.pos + (j - 1))
             dj = self.mtp(st, self.vt[j:j + 1], self.mhn[:1], self.mpos, 1, self.zero)
@@ -190,5 +191,26 @@ class Fast:
         # catch-up: rows i = 0..K: hidden at pos+i, token new[i] at pos+i+1; row a = n_acc - 1 gives d_1
         d1 = self.mtp(st, self.new, self.hn, self.pos, self.R, self.n_acc.long() - 1)
         self.vt[0:1].copy_(self.new.gather(0, self.n_acc.long() - 1))
+        self.vt[1:2].copy_(d1)
+        self.res[0:1].copy_(self.n_acc)
+        self.res[1:].copy_(self.new)
         self.pos.add_(self.n_acc)
-        self.draft_chain(st, d1)
+        self.draft_chain(st)
+
+    def capture(self, st):
+        """Capture the round and the draft chain as HIP graphs (state buffers are fixed; contents garbage)."""
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        self.pos.fill_(1000)
+        with torch.cuda.stream(s):
+            self.round(st)
+            self.draft_chain(st)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.g_round = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g_round):
+            self.round(st)
+        self.g_chain = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.g_chain):
+            self.draft_chain(st)
+        torch.cuda.synchronize()

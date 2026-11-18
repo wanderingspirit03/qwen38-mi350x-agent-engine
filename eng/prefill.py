@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from . import hip as H
 from . import ref_ops as R
+from .kernels.attention import attn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
 CHUNK = 4096
@@ -18,7 +19,7 @@ def gdn_chunk_ref(qk, v, gb, ssmT):
     S = ssmT.transpose(-1, -2).contiguous()
     o = R.gdn_chunked(q, k, v, gb[:, 0], gb[:, 1], S)
     ssmT.copy_(S.transpose(-1, -2))
-    return o
+    return o.contiguous()
 
 
 def attn_prefill_ref(q, kc, vc, p0, T):
@@ -32,9 +33,9 @@ def attn_prefill_ref(q, kc, vc, p0, T):
 
 
 class Prefill:
-    def __init__(self, w, dev="cuda", gdn_chunk=gdn_chunk_ref, attn_prefill=attn_prefill_ref):
+    def __init__(self, w, dev="cuda", gdn_chunk=gdn_chunk_ref):
         self.w = w
-        self.gdn_chunk, self.attn_prefill = gdn_chunk, attn_prefill
+        self.gdn_chunk = gdn_chunk
         C = CHUNK
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.x = torch.empty(C, HIDDEN, **bf)
@@ -58,9 +59,8 @@ class Prefill:
     def _attn(self, L, li, st, p0, T):
         torch.matmul(self.h[:T], L["qkv"].t(), out=self.qkv[:T])
         H.attn_prep(self.qkv[:T], L["q_norm"], L["k_norm"], self.pos, self.q[:T], st.k[li], st.v[li])
-        o = self.attn_prefill(self.q[:T], st.k[li], st.v[li], p0, T)
-        self.ao[:T].copy_(o)
-        H.gate_mul(self.ao[:T], self.qkv[:T])
+        gate = self.qkv[:T, :HEADS * 512].view(T, HEADS, 512)[..., HEAD_DIM:]
+        attn_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM))
         torch.matmul(self.ao[:T], L["o"].t(), out=self.d[:T])
 
     def _mlp(self, L, T):

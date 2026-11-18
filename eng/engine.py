@@ -24,6 +24,9 @@ class Engine:
         self.st.k, self.st.v = self.kv[0], self.kv[1]
         self.pre = Prefill(self.w)
         self.fast = Fast(self.w, SPEC_K)
+        self.graphs = os.environ.get("ENG_GRAPHS", "1") == "1"
+        if self.graphs:
+            self.fast.capture(self.st)
         self.cache = PrefixCache(int(CACHE_GB * 2**30))
         self.log = os.environ.get("ENG_LOG", "1") == "1"
 
@@ -87,12 +90,13 @@ class Engine:
         F.pos.fill_(n)
         F.vt[0] = x
         F.mhn[:1].copy_(mh)
-        F.draft_chain(st, ml.argmax(-1))
+        F.vt[1:2].copy_(ml.argmax(-1))
+        F.g_chain.replay() if self.graphs else F.draft_chain(st)
         out = [x]
         rounds = 0
         while not self._done(out, max_tokens):
-            F.round(st)
-            k = int(F.n_acc.item())
-            out += F.new[:k].tolist()
+            F.g_round.replay() if self.graphs else F.round(st)
+            res = F.res.tolist()
+            out += res[1:1 + res[0]]
             rounds += 1
         return out, rounds

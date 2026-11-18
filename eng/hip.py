@@ -85,6 +85,7 @@ lib.conv_update.argtypes = [P, P, I, P, P]
 
 def gated_norm(o, proj, gw, out):
     """o (T, 48, 128) fp32 -> out (T, 6144) bf16, gated by z = proj[:, 10240:16384]."""
+    assert o.is_contiguous() and out.is_contiguous()
     _check(lib.gated_norm(o.shape[0], p(o), p(proj), proj.stride(0), p(gw), p(out), stream()), "gated_norm")
 
 

@@ -57,7 +57,7 @@ __global__ void gdn_prep_kernel(const bf16* __restrict__ proj, int pstride, cons
 
 // The value column of a thread group of 4: thread part p holds S[k] for k in [32p, 32p + 32).
 #define KP 32
-#define VB 32   // value columns per block (block = VB * 4 threads)
+#define VB 32   // value columns per block (block = VB * 4 threads = DK: the loaders below rely on it)
 static __device__ __forceinline__ float dpp_xor1(float x) {
   return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, true));
 }
@@ -107,22 +107,35 @@ static __device__ __forceinline__ void run_steps(int n, int h, int vb, const flo
                                                  const float* __restrict__ state, float* __restrict__ o_out,
                                                  float* __restrict__ state_out) {
   int tid = threadIdx.x, lc = tid >> 2, part = tid & 3, kh = h / 3, col = vb * VB + lc;
-  __shared__ float sq[16][DK], sk[16][DK], sv[16][VB], sg[16], sb[16];
+  // [t][part][36]: the 4 k-parts start 144 bytes apart, on different LDS banks
+  __shared__ __attribute__((aligned(16))) float sq[16][4][36], sk[16][4][36];
+  __shared__ float sv[16][VB], sg[16], sb[16];
   float S[KP];
   load_state(S, state + ((size_t)h * DK + col) * DK + part * KP);
-  for (int i = tid; i < n * DK; i += VB * 4) {
-    int t = i >> 7, c = i & 127;
-    sq[t][c] = qk[(t * 32 + kh) * DK + c];
-    sk[t][c] = qk[(t * 32 + 16 + kh) * DK + c];
+  // issue every load before the first LDS store (one memory latency, not n)
+  float rq[16], rk[16], rv[4];
+#pragma unroll
+  for (int j = 0; j < 16; j++)
+    if (j < n) { rq[j] = qk[(j * 32 + kh) * DK + tid]; rk[j] = qk[(j * 32 + 16 + kh) * DK + tid]; }
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int t = j * 4 + (tid >> 5);
+    if (t < n) rv[j] = v[(t * NH + h) * DK + vb * VB + (tid & 31)];
   }
-  for (int i = tid; i < n * VB; i += VB * 4) {
-    int t = i / VB, c = i % VB;
-    sv[t][c] = v[(t * NH + h) * DK + vb * VB + c];
+  float rg = 0.f, rb = 0.f;
+  if (tid < n) { rg = gb[(tid * 2) * NH + h]; rb = gb[(tid * 2 + 1) * NH + h]; }
+#pragma unroll
+  for (int j = 0; j < 16; j++)
+    if (j < n) { sq[j][tid >> 5][tid & 31] = rq[j]; sk[j][tid >> 5][tid & 31] = rk[j]; }
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int t = j * 4 + (tid >> 5);
+    if (t < n) sv[t][tid & 31] = rv[j];
   }
-  if (tid < n) { sg[tid] = gb[(tid * 2) * NH + h]; sb[tid] = gb[(tid * 2 + 1) * NH + h]; }
+  if (tid < n) { sg[tid] = rg; sb[tid] = rb; }
   __syncthreads();
   for (int t = 0; t < n; t++) {
-    float o = delta_step(S, sq[t] + part * KP, sk[t] + part * KP, sv[t][lc], sg[t], sb[t]);
+    float o = delta_step(S, sq[t][part], sk[t][part], sv[t][lc], sg[t], sb[t]);
     if (o_out && part == 0) o_out[((size_t)t * NH + h) * DK + col] = o;
   }
   if (state_out) {
