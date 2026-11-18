@@ -1,0 +1,11 @@
+#!/bin/bash
+# serve <port>: the engine's container (image $IJ_ENGINE_IMAGE, built from ./Dockerfile) on the host network.
+set -euo pipefail
+PORT="$1"
+L=/opt/ij-amd/amd/controller/box/ij-docker
+IMAGE="${IJ_ENGINE_IMAGE:-ij-builder/engine:latest}"
+rmc() { sudo -n "$L" rm engine > /dev/null 2>&1 || true; }
+rmc
+trap rmc EXIT TERM INT
+sudo -n "$L" run --rm --name engine --shm-size 16g -e "ENG_ARGS=${ENG_ARGS:-}" "$IMAGE" python3 -m eng.main "$PORT" &
+wait $!
