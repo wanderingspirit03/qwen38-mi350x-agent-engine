@@ -25,8 +25,15 @@ def _prefill_kernel(Q, K, V, O, G, p0, T, NBLK,
                     qk_scale,
                     GROUP: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                     HAS_GATE: tl.constexpr):
-    h = tl.program_id(0)
-    mb = NBLK - 1 - tl.program_id(1)            # longest rows first
+    # 1-D grid of 48 programs per pair of row blocks, longest rows first. Workgroups go round-robin over the 8 XCDs:
+    # XCD x gets the 6 query heads of KV head x % 4 for one row block, so they share K/V in that XCD's L2.
+    pid = tl.program_id(0)
+    x = pid % 8
+    h = (x % 4) * GROUP + (pid // 8) % GROUP
+    r = (pid // (8 * GROUP)) * 2 + x // 4
+    if r >= NBLK:
+        return
+    mb = NBLK - 1 - r
     g = h // GROUP
     start = mb * BLOCK_M
     offs_m = start + tl.arange(0, BLOCK_M)
@@ -46,9 +53,9 @@ def _prefill_kernel(Q, K, V, O, G, p0, T, NBLK,
     full_end = ((p0 + start + 1) // BLOCK_N) * BLOCK_N
     for j in range(0, full_end, BLOCK_N):
         kT = tl.load(kT_ptr + j * sk_n)
-        s = tl.dot(q, kT) * qk_scale
-        m_new = tl.maximum(m_i, tl.max(s, 1))
-        p = tl.math.exp2(s - m_new[:, None])
+        s = tl.dot(q, kT)                       # unscaled: the scale goes into one FMA with the max
+        m_new = tl.maximum(m_i, tl.max(s, 1) * qk_scale)
+        p = tl.math.exp2(s * qk_scale - m_new[:, None])
         alpha = tl.math.exp2(m_i - m_new)
         l_i = l_i * alpha + tl.sum(p, 1)
         v = tl.load(v_ptr + j * sk_n)
@@ -94,7 +101,7 @@ def attn_prefill(q, k_cache, v_cache, p0, gate=None, out=None, cfg=None):
     gt = gate if gate is not None else o
     nblk = triton.cdiv(T, cfg["BLOCK_M"])
     extra = {k: v for k, v in cfg.items() if k not in ("BLOCK_M", "BLOCK_N")}
-    _prefill_kernel[(HEADS, nblk)](
+    _prefill_kernel[(triton.cdiv(nblk, 2) * 2 * HEADS,)](
         q, k_cache, v_cache, o, gt, int(p0), T, nblk,
         q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), o.stride(0), o.stride(1),
         gt.stride(0), gt.stride(1), SCALE * LOG2E,
