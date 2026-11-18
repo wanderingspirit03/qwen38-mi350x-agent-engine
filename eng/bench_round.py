@@ -59,8 +59,10 @@ def main():
     print(f"whole round (K={K}): {tm(rnd):.3f} ms", flush=True)
     from torch.profiler import ProfilerActivity, profile
     F.pos.fill_(N)
+    what = os.environ.get("BENCH_PROF", "round")
+    fn = {"round": lambda: F.round(st), "chain": lambda: F.draft_chain(st)}[what]
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        F.round(st)
+        fn()
         torch.cuda.synchronize()
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30, max_name_column_width=60))
 
