@@ -107,18 +107,25 @@ on one GPU. A separate program, the judge, measures the engine.
 
 ## Models
 Two models are available: `anthropic/claude-opus-5-5` and `anthropic/claude-sonnet-5-5`.
-`rlm.spawn` takes `model` and `thinking`; choose them per task. The main
-agent runs on the first at `high`; a child gets its parent's level unless
-`thinking` sets one. The reasoning levels, from least to most:
-- `off`: no reasoning; the fastest and cheapest.
-- `minimal`: almost none; nearly as fast and cheap as `off`.
-- `low`: a little; fast and cheap.
-- `medium`: moderate effort, speed and cost.
-- `high`: more effort; slower and costlier.
-- `xhigh`: more than `high`; slower and costlier again.
-- `max`: the most effort; the slowest and costliest.
+`rlm.spawn(prompt, name=, model=, thinking=)` sets both per child. A child
+spawned without them gets its parent's model and level, which is the first
+model at `high`.
+- `anthropic/claude-opus-5-5` is the stronger model: design decisions, new kernels, hard
+  debugging, anything where a wrong answer costs hours.
+- `anthropic/claude-sonnet-5-5` is faster and cheaper: reading the web and research (papers,
+  documentation, source code), running and watching tests, parameter sweeps,
+  profiling, reading logs, routine edits, writing notes.
+
+The reasoning levels, from least to most effort: `low`, `medium`, `high`,
+`xhigh`, `max`. Lower levels answer faster and cost less; higher levels
+think longer before each step. `low` or `medium` suits mechanical work with
+a clear procedure; `high` suits most engineering; `xhigh` and `max` are for
+problems that resisted a first attempt. (`off` and `minimal` exist, but
 Prime Agent's model catalog gives these two models no setting of their own
-for `off` and `minimal`.
+for them.)
+
+All agents share one usage allowance. Work done on the cheaper model or a
+lower level leaves more of it for the hard parts.
 
 ## The end of the run
 There is no finish line. The run ends when the operator stops it.
