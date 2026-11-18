@@ -60,22 +60,22 @@ def check_all_configs(N=5120, K=6144):
                 for nt in (1, 2, 4, 8):
                     for waves in (1, 2, 4, 8, 16):
                         for ks in (1, 3):
-                            for ntl in (1,):
-                                cfg = (nt, waves, ks, ntl)
-                                if nt * -(-K // 128 // ks) * (128 // G) * 48 > 65536:
-                                    continue
-                                y = w4.gemm(x, p, cfg=cfg)
-                                e = rel(y, yr)
-                                e2 = 0
-                                if not swiglu:   # in-place residual
-                                    rr = r.clone()
-                                    w4.gemm(x, p, out=rr, residual=rr, cfg=cfg)
-                                    e2 = rel(rr, yrr)
-                                n += 1
-                                if not (e < 5e-3 and e2 < 5e-3):
-                                    bad += 1
-                                    print(f"FAIL G={G} rms={rms} swiglu={swiglu} M={M} cfg={cfg} err {e:.3e} {e2:.3e}",
-                                          flush=True)
+                            cfg = (nt, waves, ks)
+                            if ((waves == 16 and nt > 2) or (swiglu and nt % 2)
+                                    or w4.lds_bytes(nt, ks, K, G) > 65536):
+                                continue
+                            y = w4.gemm(x, p, cfg=cfg)
+                            e = rel(y, yr)
+                            e2 = 0
+                            if not swiglu:   # in-place residual
+                                rr = r.clone()
+                                w4.gemm(x, p, out=rr, residual=rr, cfg=cfg)
+                                e2 = rel(rr, yrr)
+                            n += 1
+                            if not (e < 5e-3 and e2 < 5e-3):
+                                bad += 1
+                                print(f"FAIL G={G} rms={rms} swiglu={swiglu} M={M} cfg={cfg} err {e:.3e} {e2:.3e}",
+                                      flush=True)
     print(f"all configs: {bad} failures of {n}", flush=True)
     # the fused path against the plain PyTorch ops of the model, with the unquantized weights as reference:
     # the fused error should be about the plain 4-bit error
@@ -172,7 +172,7 @@ def bench(names, cfgs=None, Ms=MS, G=128, fused=False, matmul=False, verbose=Fal
             best = None
             for cfg in (cfgs or [None]):
                 if cfg is not None and (N % (16 * cfg[0]) or (cfg[2] > 1 and cfg[2] * (M * N + N // cfg[0] * 16) > w4.WS_FLOATS)
-                                        or cfg[0] * -(-K // 128 // cfg[2]) * (128 // G) * 48 > 65536):
+                                        or w4.lds_bytes(cfg[0], cfg[2], K, G) > 65536):
                     continue
                 t = graph_time([lambda p=p: w4.gemm(x, p, out=out, residual=out if resid else None, cfg=cfg)
                                 for p in ps])
@@ -191,8 +191,8 @@ def bench(names, cfgs=None, Ms=MS, G=128, fused=False, matmul=False, verbose=Fal
     return res
 
 
-TUNE_CFGS = [(nt, w, ks, 1) for nt in (1, 2, 4, 8) for w in (1, 2, 4, 8, 16) for ks in (1, 2, 4)
-             if not (nt == 8 and w == 16)]
+TUNE_CFGS = [(nt, w, ks) for nt in (1, 2, 4, 8) for w in (1, 2, 4, 8, 16) for ks in (1, 2, 4)
+             if not (nt > 2 and w == 16)]
 
 
 def tune(names):
@@ -202,20 +202,6 @@ def tune(names):
             r = sorted((t, c) for (n, m, c), t in res.items() if n == name and m == M)[:4]
             print(name, M, " ".join(f"{c}:{t * 1e6:.1f}" for t, c in r), flush=True)
     return res
-
-
-VARIANTS = {"base": None, "x_once": "#define X_ONCE\n"}
-
-
-def variants(names=("gate_up", "down", "out", "lm_head")):
-    """What the per-group scale/zero loads and the epilogue math cost (the cut variants give wrong results)."""
-    cfgs = [(2, 8, 1, 1), (2, 16, 1, 1), (4, 2, 1, 1), (2, 1, 1, 1)]
-    for v, pre in VARIANTS.items():
-        w4._lib = None
-        w4._lib = w4._build(pre) if pre else w4._build()
-        print("variant", v, flush=True)
-        bench(list(names), cfgs, Ms=(1, 16))
-    w4._lib = None
 
 
 def main():
@@ -232,8 +218,6 @@ def main():
         check(names)
     if mode == "tune":
         tune(names)
-    if mode == "variants":
-        variants()
     if mode == "bench":
         bench(names)
         bench(names, fused=True, Ms=(1, 16))

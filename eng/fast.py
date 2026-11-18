@@ -35,22 +35,27 @@ class SeqState:
         self.max_len = max_len
 
 
-W4 = os.environ.get("ENG_W4", "1") == "1"
 W4_HEAD = os.environ.get("ENG_W4_HEAD", "1") == "1"
 
 
 class Linear:
-    """x (M <= 16, K) @ W^T: 4-bit weights (eng.kernels.w4) or bf16 matmul."""
+    """x (M <= 16, K) @ W^T on 4-bit weights (eng.kernels.w4). norm: the RMSNorm weight in front of W, folded in
+    (x is then the raw residual stream); swiglu: W is [gate; up] and the output is silu(gate) * up;
+    add=True: out += x @ W^T (out is the residual stream)."""
 
-    def __init__(self, w, w4=W4):
-        self.p = w4q.quantize(w) if w4 else None
-        self.w = None if w4 else w
+    def __init__(self, w, norm=None, swiglu=False):
+        self.p = w4q.quantize(w, norm_weight=norm, swiglu=swiglu)
+
+    def __call__(self, x, out, add=False):
+        w4q.gemm(x, self.p, out=out, residual=out if add else None)
+
+
+class Bf16Linear:
+    def __init__(self, w):
+        self.w = w
 
     def __call__(self, x, out):
-        if self.p is not None:
-            w4q.gemm(x, self.p, out=out)
-        else:
-            torch.matmul(x, self.w.t(), out=out)
+        torch.matmul(x, self.w.t(), out=out)
 
 
 def attn_decode_ref(q, kc, vc, pos_dev, R):
@@ -91,8 +96,6 @@ class Fast:
         self.dtb = torch.stack([L["dt_bias"] for L in G]).contiguous()
         # buffers
         self.x = torch.empty(R, HIDDEN, **bf)
-        self.h = torch.empty(R, HIDDEN, **bf)
-        self.d = torch.empty(R, HIDDEN, **bf)
         self.proj = torch.empty(48, R, PROJ, **bf)
         self.qk = torch.empty(48, R, 32, 128, dtype=torch.float32, device=dev)
         self.vv = torch.empty(48, R, 48, 128, dtype=torch.float32, device=dev)
@@ -102,7 +105,6 @@ class Fast:
         self.qkv = torch.empty(R, 14336, **bf)
         self.q = torch.empty(R, HEADS, HEAD_DIM, **bf)
         self.ao = torch.empty(R, HEADS * HEAD_DIM, **bf)
-        self.gu = torch.empty(R, 2 * INTER, **bf)
         self.act = torch.empty(R, INTER, **bf)
         self.logits = torch.empty(R, VOCAB, **bf)
         self.hn = torch.empty(R, HIDDEN, **bf)          # final-normed hidden (MTP input)
@@ -124,45 +126,51 @@ class Fast:
         self.zero = torch.zeros(1, dtype=torch.long, device=dev)
 
     # ---- the target model on R rows ----
-    def mlp(self, lin, L, rows):
+    @staticmethod
+    def _layer_lin(L, attn):
+        d = {"gate_up": Linear(L["gate_up"], L["post_norm"], swiglu=True), "down": Linear(L["down"])}
+        if attn:
+            d["qkv"], d["o"] = Linear(L["qkv"], L["in_norm"]), Linear(L["o"])
+        else:
+            d["in_proj"], d["out"] = Linear(L["in_proj"], L["in_norm"]), Linear(L["out"])
+        return d
+
+    def mlp(self, lin, rows):
+        """x += down(swiglu(gate_up(norm(x))))"""
         R = rows
-        H.add_rmsnorm(self.x[:R], self.d[:R], L["post_norm"], self.h[:R])
-        lin["gate_up"](self.h[:R], self.gu[:R])
-        H.silu_mul(self.gu[:R], self.act[:R])
-        lin["down"](self.act[:R], self.d[:R])
+        lin["gate_up"](self.x[:R], self.act[:R])
+        lin["down"](self.act[:R], self.x[:R], add=True)
 
     def verify(self, st):
         """self.vt at positions self.pos.. -> self.y (argmax per row), self.hn."""
         w, R = self.w, self.R
         torch.index_select(w.embed, 0, self.vt, out=self.x)
-        self.d.zero_()
         ai = gi = 0
         for i, L in enumerate(w.layers):
             lin = self.lin[i]
-            H.add_rmsnorm(self.x, self.d, L["in_norm"], self.h)
             if IS_ATTN[i]:
                 self.attn(lin, L, ai, st, self.pos, R)
                 ai += 1
             else:
                 proj = self.proj[gi]
-                lin["in_proj"](self.h, proj)
+                lin["in_proj"](self.x, proj)
                 H.gdn_prep(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], self.qk[gi], self.vv[gi],
                            self.gb[gi])
                 H.gdn_verify(self.qk[gi], self.vv[gi], self.gb[gi], st.ssm[gi], self.ob, proj, L["gnorm"], self.go)
-                lin["out"](self.go, self.d)
+                lin["out"](self.go, self.x, add=True)
                 gi += 1
-            self.mlp(lin, L, R)
-        H.add_rmsnorm(self.x, self.d, w.final_norm, self.hn)
+            self.mlp(lin, R)
+        H.add_rmsnorm(self.x, None, w.final_norm, self.hn)
         self.head(self.hn, self.logits)
         torch.argmax(self.logits, -1, out=self.y)
 
     def attn(self, lin, L, li, st, pos, R):
-        lin["qkv"](self.h[:R], self.qkv[:R])
+        lin["qkv"](self.x[:R], self.qkv[:R])
         H.attn_prep(self.qkv[:R], L["q_norm"], L["k_norm"], pos, self.q[:R], st.k[li], st.v[li])
         torch.add(pos, R, out=self.nkv)
         gate = self.qkv[:R, :HEADS * 512].view(R, HEADS, 512)[..., HEAD_DIM:]
         attn_decode(self.q[:R], st.k[li], st.v[li], self.nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM))
-        lin["o"](self.ao[:R], self.d[:R])
+        lin["o"](self.ao[:R], self.x[:R], add=True)
 
     # ---- acceptance and commit ----
     def accept(self, st):
@@ -185,10 +193,9 @@ class Fast:
         H.add_rmsnorm(self.mh[:R], None, M["pre_emb"], self.mx[:R, :HIDDEN])
         H.add_rmsnorm(hidden, None, M["pre_hid"], self.mx[:R, HIDDEN:])
         self.mlin["fc"](self.mx[:R], self.x[:R])
-        H.add_rmsnorm(self.x[:R], None, M["in_norm"], self.h[:R])
         self.attn(self.mlin, M, 16, st, pos, R)
-        self.mlp(self.mlin, M, R)
-        H.add_rmsnorm(self.x[:R], self.d[:R], M["norm"], self.mh[:R])
+        self.mlp(self.mlin, R)
+        H.add_rmsnorm(self.x[:R], None, M["norm"], self.mh[:R])
         row = self.mh[:R].index_select(0, pick)
         self.mhn[:1].copy_(row)
         self.dhead(self.mhn[:1], self.mlogit)

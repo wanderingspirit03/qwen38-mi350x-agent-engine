@@ -57,6 +57,85 @@ struct Pend {          // MFMA results of one k block whose scale/zero epilogue 
 
 enum { F_SWIGLU = 1 };
 
+// After the k loop: split-k reduction (the last of the ksplit workgroups of a unit adds the partials up),
+// 1/rms scaling, then SwiGLU or the (optional) residual add, and the bf16 store. unit: index of the
+// independent group of NT row tiles (counter and sum(x^2) slot). acc[NT] holds x.x^T if RMS.
+template <int NT, bool RMS>
+__device__ __forceinline__ void finish(f32x4* acc, int unit, int tile0, int lane, __bf16* y, const __bf16* res,
+                                       float* ws, int* cnt, int M, int N, int K, int flags, float eps) {
+    const int lg = lane >> 4, m = lane & 15;
+    const bool mok = m < M;
+    const int ksplit = gridDim.y;
+    float ss = 0.f;
+    if (RMS) {   // diagonal: D[m][m] sits in lane m + 16 (m / 4), element m % 4
+        const int src = m + 16 * (m >> 2);
+        const float d0 = __shfl(acc[NT][0], src), d1 = __shfl(acc[NT][1], src);
+        const float d2 = __shfl(acc[NT][2], src), d3 = __shfl(acc[NT][3], src);
+        const int j = m & 3;
+        ss = j == 0 ? d0 : j == 1 ? d1 : j == 2 ? d2 : d3;
+    }
+    if (ksplit > 1) {
+        // write the partial sums, the last workgroup of this row tile adds them up
+        float* wss = ws + (size_t)ksplit * M * N + (size_t)unit * ksplit * 16;  // partial sum(x^2)
+        if (mok) {
+#pragma unroll
+            for (int t = 0; t < NT; t++)
+                *(f32x4*)(ws + ((size_t)blockIdx.y * M + m) * N + (tile0 + t) * 16 + lg * 4) = acc[t];
+            if (RMS && lg == 0) wss[blockIdx.y * 16 + m] = ss;
+        }
+        __threadfence();
+        int prev = 0;
+        if (lane == 0) prev = atomicAdd(cnt + unit, 1);
+        prev = __shfl(prev, 0);
+        if (prev != ksplit - 1) return;
+        __threadfence();
+        if (lane == 0) cnt[unit] = 0;
+        if (!mok) return;
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+            f32x4 s = f32x4{0.f, 0.f, 0.f, 0.f};
+            for (int k = 0; k < ksplit; k++)
+                s += __builtin_nontemporal_load((const f32x4*)(ws + ((size_t)k * M + m) * N + (tile0 + t) * 16 + lg * 4));
+            acc[t] = s;
+        }
+        if (RMS) {
+            ss = 0.f;
+            for (int k = 0; k < ksplit; k++) ss += __builtin_nontemporal_load(wss + k * 16 + m);
+        }
+    }
+    if (!mok) return;
+    if (RMS) {
+        const float r = rsqrtf(ss / (float)K + eps);
+#pragma unroll
+        for (int t = 0; t < NT; t++) acc[t] *= r;
+    }
+    if (flags & F_SWIGLU) {
+        const int N2 = N >> 1;
+#pragma unroll
+        for (int t = 0; t < NT; t += 2) {
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int n = ((tile0 + t) >> 1) * 16 + lg * 4 + j;
+                const size_t o = (size_t)m * N2 + n;
+                const float gt = (float)(__bf16)acc[t][j], up = (float)(__bf16)acc[t + 1][j];
+                y[o] = (__bf16)(gt / (1.f + __expf(-gt)) * up);
+            }
+        }
+        return;
+    }
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const int n = (tile0 + t) * 16 + lg * 4 + j;
+            const size_t o = (size_t)m * N + n;
+            float v = acc[t][j];
+            if (res) v += (float)res[o];
+            y[o] = (__bf16)v;
+        }
+    }
+}
+
 // grid: (N / (16 NT), KSPLIT). Workgroup: WAVES waves on the same NT row tiles, splitting its k range.
 // RMS: x is the un-normalized input; the kernel computes sum(x^2) per row (diagonal of an x.x^T MFMA) and
 // scales the result by 1/sqrt(mean + eps) (the norm weight is folded into W at quantize time).
@@ -104,22 +183,12 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
         }
     }
 
-#ifdef X_ONCE
-    u32x4 xfix[4];
-#pragma unroll
-    for (int s = 0; s < 4; s++) xfix[s] = *(const u32x4*)(xrow + s * 32);
-#endif
     auto load = [&](Frag<NT, GPB>& f, int kb) {
         kb = min(kb, kb1 - 1);
 #pragma unroll
         for (int t = 0; t < NT; t++) f.w[t] = ldw<NTL>(qbase + ((size_t)t * KB + kb) * 64);
-#ifndef X_ONCE
 #pragma unroll
         for (int s = 0; s < 4; s++) f.x[s] = *(const u32x4*)(xrow + kb * 128 + s * 32);
-#else
-#pragma unroll
-        for (int s = 0; s < 4; s++) f.x[s] = xfix[s] ^ (uint32_t)kb;
-#endif
     };
     const char* lm = (const char*)lmeta;
     auto meta_lds = [&](Pend<NT, GPB>& p, int kb) {
@@ -216,90 +285,23 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
         for (int t = 0; t < NA; t++)
             for (int w = 0; w < WAVES - 1; w++) acc[t] += red[w][t][lane];
     }
-    float ss = 0.f;
-    if (RMS) {   // diagonal: D[m][m] sits in lane m + 16 (m / 4), element m % 4
-        const int src = m + 16 * (m >> 2);
-        const float d0 = __shfl(acc[NT][0], src), d1 = __shfl(acc[NT][1], src);
-        const float d2 = __shfl(acc[NT][2], src), d3 = __shfl(acc[NT][3], src);
-        const int j = m & 3;
-        ss = j == 0 ? d0 : j == 1 ? d1 : j == 2 ? d2 : d3;
-    }
-    if (ksplit > 1) {
-        // write the partial sums, the last workgroup of this row tile adds them up
-        float* wss = ws + (size_t)ksplit * M * N + (size_t)blockIdx.x * ksplit * 16;  // partial sum(x^2)
-        if (mok) {
-#pragma unroll
-            for (int t = 0; t < NT; t++)
-                *(f32x4*)(ws + ((size_t)blockIdx.y * M + m) * N + (tile0 + t) * 16 + lg * 4) = acc[t];
-            if (RMS && lg == 0) wss[blockIdx.y * 16 + m] = ss;
-        }
-        __threadfence();
-        int prev = 0;
-        if (lane == 0) prev = atomicAdd(cnt + blockIdx.x, 1);
-        prev = __shfl(prev, 0);
-        if (prev != ksplit - 1) return;
-        __threadfence();
-        if (lane == 0) cnt[blockIdx.x] = 0;
-        if (!mok) return;
-#pragma unroll
-        for (int t = 0; t < NT; t++) {
-            f32x4 s = f32x4{0.f, 0.f, 0.f, 0.f};
-            for (int k = 0; k < ksplit; k++)
-                s += __builtin_nontemporal_load((const f32x4*)(ws + ((size_t)k * M + m) * N + (tile0 + t) * 16 + lg * 4));
-            acc[t] = s;
-        }
-        if (RMS) {
-            ss = 0.f;
-            for (int k = 0; k < ksplit; k++) ss += __builtin_nontemporal_load(wss + k * 16 + m);
-        }
-    }
-    if (!mok) return;
-    if (RMS) {
-        const float r = rsqrtf(ss / (float)K + eps);
-#pragma unroll
-        for (int t = 0; t < NT; t++) acc[t] *= r;
-    }
-    if (flags & F_SWIGLU) {
-        const int N2 = N >> 1;
-#pragma unroll
-        for (int t = 0; t < NT; t += 2) {
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const int n = ((tile0 + t) >> 1) * 16 + lg * 4 + j;
-                const size_t o = (size_t)m * N2 + n;
-                const float gt = (float)(__bf16)acc[t][j], up = (float)(__bf16)acc[t + 1][j];
-                y[o] = (__bf16)(gt / (1.f + __expf(-gt)) * up);
-            }
-        }
-        return;
-    }
-#pragma unroll
-    for (int t = 0; t < NT; t++) {
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            const int n = (tile0 + t) * 16 + lg * 4 + j;
-            const size_t o = (size_t)m * N + n;
-            float v = acc[t][j];
-            if (res) v += (float)res[o];
-            y[o] = (__bf16)v;
-        }
-    }
+    finish<NT, RMS>(acc, blockIdx.x, tile0, lane, y, res, ws, cnt, M, N, K, flags, eps);
 }
 
-#define INST(NT, G, W, NTL, RMS) \
-    if (nt == NT && g == G && waves == W && ntl == NTL && rms == RMS) { \
-        hipLaunchKernelGGL((w4_gemm_kernel<NT, G, W, NTL, RMS>), dim3(N / 16 / NT, ksplit), dim3(W * 64), \
+#define INST(NT, G, W, RMS) \
+    if (nt == NT && g == G && waves == W && rms == RMS) { \
+        hipLaunchKernelGGL((w4_gemm_kernel<NT, G, W, true, RMS>), dim3(N / 16 / NT, ksplit), dim3(W * 64), \
             NT * ((K / 128 + ksplit - 1) / ksplit) * (128 / G) * 48, stream, \
             (const __bf16*)x, (const u32x4*)qw, (const u32x4*)meta, (__bf16*)y, \
             (const __bf16*)res, ws, cnt, M, N, K, 0x000F000Fu, 0x43004300u, flags, eps); \
         return 0; }
 
-#define INST_W(NT, G, RMS) INST(NT, G, 1, 1, RMS) INST(NT, G, 2, 1, RMS) INST(NT, G, 4, 1, RMS) INST(NT, G, 8, 1, RMS) \
-                           INST(NT, G, 16, 1, RMS)
-#define INST_G(G, RMS) INST_W(1, G, RMS) INST_W(2, G, RMS) INST_W(4, G, RMS) INST_W(8, G, RMS)
+#define INST_W(NT, G, RMS) INST(NT, G, 1, RMS) INST(NT, G, 2, RMS) INST(NT, G, 4, RMS) INST(NT, G, 8, RMS)
+#define INST_G(G, RMS) INST_W(1, G, RMS) INST_W(2, G, RMS) INST_W(4, G, RMS) INST_W(8, G, RMS) \
+                       INST(1, G, 16, RMS) INST(2, G, 16, RMS)
 
 extern "C" int w4_gemm(const void* x, const void* qw, const void* meta, void* y, const void* res,
-                       float* ws, int* cnt, int M, int N, int K, int g, int nt, int waves, int ksplit, int ntl,
+                       float* ws, int* cnt, int M, int N, int K, int g, int nt, int waves, int ksplit,
                        int rms, int flags, float eps, hipStream_t stream) {
     INST_G(128, 0) INST_G(64, 0) INST_G(128, 1) INST_G(64, 1)
     return -1;

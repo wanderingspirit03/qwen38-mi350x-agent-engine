@@ -14,7 +14,9 @@ API:
     y = gemm(x, p, out=None, residual=None)
         x (M, K) bf16 contiguous, M <= 16 -> (M, N) bf16 (+ residual; residual may be out itself: in place).
     w = dequantize(p)    (N, K) fp32 (norm weight folded in, rows interleaved if swiglu), for checks.
-No host synchronization in gemm(): it can be captured in a HIP graph.
+No host synchronization in gemm(): it can be captured in a HIP graph (call it once before capturing, so that the
+kernels are compiled and loaded). The split-k workspace and counters are shared per device: do not run two
+split-k gemm() calls concurrently on different streams.
 """
 import ctypes
 import hashlib
@@ -48,7 +50,7 @@ def _build(prefix=None):
         os.replace(tmp, so)
     lib = ctypes.CDLL(so)
     lib.w4_gemm.restype = ctypes.c_int
-    lib.w4_gemm.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 10 + [ctypes.c_float, ctypes.c_void_p])
+    lib.w4_gemm.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 9 + [ctypes.c_float, ctypes.c_void_p])
     if prefix is None:
         _lib = lib
     return lib
@@ -149,16 +151,27 @@ def _workspace(device):
     return _ws[device]
 
 
-# (row tiles of 16 per wave, waves per workgroup, k splits, nontemporal weight loads), by (N, K) and M
-CONFIGS = {}
-DEFAULT_CFG = (2, 4, 1, 1)
+# Configurations: (row tiles of 16 per wave, waves per workgroup, k splits), tuned on MI350X per (N, K) as a
+# list of (largest M, config). Other shapes get DEFAULT.
+CONFIGS = {
+    (34816, 5120): [(2, (2, 4, 1)), (4, (2, 2, 1)), (8, (4, 4, 1)), (16, (4, 2, 1))],   # MLP gate+up
+    (5120, 17408): [(16, (2, 8, 1))],                                                 # MLP down
+    (16480, 5120): [(4, (2, 4, 1)), (16, (2, 2, 1))],                                 # GDN in_proj
+    (5120, 6144): [(8, (2, 8, 1)), (16, (2, 4, 1))],                                  # GDN / attention out
+    (14336, 5120): [(16, (4, 4, 1))],                                                 # attention q+gate,k,v
+    (248320, 5120): [(4, (4, 1, 1)), (16, (8, 1, 1))],                                # LM head
+}
+DEFAULT = [(4, (2, 4, 1)), (16, (2, 2, 1))]
+
+
+def lds_bytes(nt, ksplit, K, G):
+    return nt * -(-(K // 128) // ksplit) * (128 // G) * 48
 
 
 def config_for(N, K, M):
-    c = CONFIGS.get((N, K))
-    if c is None:
-        return DEFAULT_CFG
-    return c[0] if M <= 8 else c[1]
+    for m, c in CONFIGS.get((N, K), DEFAULT):
+        if M <= m:
+            return c
 
 
 def gemm(x, p, out=None, residual=None, cfg=None):
@@ -171,16 +184,15 @@ def gemm(x, p, out=None, residual=None, cfg=None):
     assert residual is None or (not p["swiglu"] and residual.shape == (M, N) and residual.is_contiguous())
     if out is None:
         out = torch.empty(M, No, dtype=torch.bfloat16, device=x.device)
-    nt, waves, ksplit, ntl = cfg or config_for(N, K, M)
-    if p["swiglu"] and nt % 2:
-        nt += 1
-    assert N % (16 * nt) == 0 and N // (16 * nt) <= 65536
+    nt, waves, ksplit = cfg or config_for(N, K, M)
+    assert not (p["swiglu"] and nt % 2), "swiglu needs an even number of row tiles per wave"
+    assert N % (16 * nt) == 0 and N // (16 * nt) <= 65536 and waves in (1, 2, 4, 8, 16)
     ws, cnt = _workspace(x.device)
     assert ksplit == 1 or ksplit * (M * N + N // nt * 16) <= WS_FLOATS
-    assert nt * -(-K // 128 // ksplit) * (128 // p["G"]) * 48 <= 65536, "meta does not fit in LDS"
+    assert lds_bytes(nt, ksplit, K, p["G"]) <= 65536, "scales do not fit in LDS"
     rc = lib.w4_gemm(x.data_ptr(), p["qw"].data_ptr(), p["meta"].data_ptr(),
                      out.data_ptr(), residual.data_ptr() if residual is not None else None,
-                     ws.data_ptr(), cnt.data_ptr(), M, N, K, p["G"], nt, waves, ksplit, ntl,
+                     ws.data_ptr(), cnt.data_ptr(), M, N, K, p["G"], nt, waves, ksplit,
                      int(p["rms"]), int(p["swiglu"]), EPS, torch.cuda.current_stream().cuda_stream)
     assert rc == 0, "no kernel instance for this configuration"
     return out
