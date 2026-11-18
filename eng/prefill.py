@@ -94,7 +94,6 @@ class Prefill:
         self.d = torch.empty(C, HIDDEN, **bf)
         self.proj = torch.empty(C, PROJ, **bf)
         self.y = torch.empty(C, CONV_DIM, **bf)
-        self.o = torch.empty(C, 48, 128, **bf)
         self.gb = torch.empty(C, 2, 48, dtype=torch.float32, device=dev)
         self.go = torch.empty(C, V_DIM, **bf)
         self.qkv = torch.empty(C, 14336, **bf)
@@ -146,8 +145,8 @@ class Prefill:
                 q = y[:, :2048].view(T, 16, 128)
                 k = y[:, 2048:4096].view(T, 16, 128)
                 v = y[:, 4096:].view(T, 48, 128)
-                gdn_prefill(q, k, v, self.gb[:T, 0], self.gb[:T, 1], st.ssm[gi], out=self.o[:T])
-                H.gated_norm(self.o[:T], proj, L["gnorm"], self.go[:T])
+                gdn_prefill(q, k, v, self.gb[:T, 0], self.gb[:T, 1], st.ssm[gi], out=self.go[:T],
+                            z=proj[:, 10240:16384], gw=L["gnorm"])
                 H.conv_update(self.nrow, proj, st.conv[gi])
                 lin["out"](self.go[:T], self.d[:T])
                 gi += 1
