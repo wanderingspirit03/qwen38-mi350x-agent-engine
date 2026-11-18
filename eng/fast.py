@@ -38,20 +38,32 @@ class SeqState:
 HEAD_BITS = int(os.environ.get("ENG_HEAD_BITS", "8"))     # target LM head: 4, 8 or 16 bits (the draft head is 4-bit)
 
 
+FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
+_XN = torch.empty(16, 5120, dtype=torch.bfloat16, device="cuda")
+
+
 class Linear:
     """x (M <= 16, K) @ W^T on 4-bit weights (eng.kernels.w4). norm: the RMSNorm weight in front of W, folded in
     (x is then the raw residual stream); swiglu: W is [gate; up] and the output is silu(gate) * up;
     add=True: out += x @ W^T (out is the residual stream)."""
 
     def __init__(self, w, norm=None, swiglu=False):
-        self.p = w4q.quantize(w, norm_weight=norm, swiglu=swiglu)
+        # folding the norm weight into the 4-bit W roughly doubles its error (local gap 0.0077 vs 0.0033 with
+        # ENG_FOLD_NORM=0), but the separate norm kernel costs ~15% decode
+        self.norm = norm if norm is not None and not FOLD_NORM else None
+        self.p = w4q.quantize(w, norm_weight=None if self.norm is not None else norm, swiglu=swiglu)
 
     def __call__(self, x, out, add=False):
+        if self.norm is not None:
+            xn = _XN[:x.shape[0]]
+            H.add_rmsnorm(x, None, self.norm, xn)
+            x = xn
         w4q.gemm(x, self.p, out=out, residual=out if add else None)
 
 
 class W8Linear(Linear):
     def __init__(self, w):
+        self.norm = None
         self.p = w4q.quantize8(w)
 
 
