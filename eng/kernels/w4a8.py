@@ -43,9 +43,9 @@ def _build(prefix=None):
         os.replace(tmp, so)
     lib = ctypes.CDLL(so)
     lib.w4a8_gemm.restype = ctypes.c_int
-    lib.w4a8_gemm.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_float, ctypes.c_void_p]
+    lib.w4a8_gemm.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p]
     lib.w4a8_quant_x.restype = ctypes.c_int
-    lib.w4a8_quant_x.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
+    lib.w4a8_quant_x.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 2 + [ctypes.c_void_p]
     if prefix is None:
         _lib = lib
     return lib
@@ -108,16 +108,19 @@ def new_xa(M, K, device="cuda"):
             "xzp": torch.zeros(M, _ngp(K), dtype=torch.bfloat16, device=device), "M": M, "K": K}
 
 
-def quant_x(x, xa=None, norm_weight=None):
+def quant_x(x, xa=None, norm_weight=None, acc=None):
     """x (M, K) bf16 -> int8 per (row, group of 128) of x (1 + norm_weight) (or of x), plus the sums the GEMM needs.
-    With a norm weight the GEMM (p["rms"]) applies 1/rms(x) itself."""
+    With a norm weight the GEMM (p["rms"]) applies 1/rms(x) itself.
+    acc: fp32 (M, K) sums of gemm(..., acc=); first x += acc in place (bf16) and acc = 0."""
     lib = _build()
     M, K = x.shape
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and K % 128 == 0
     if xa is None:
         xa = new_xa(M, K, x.device)
     assert xa["M"] == M and xa["K"] == K
-    lib.w4a8_quant_x(x.data_ptr(), norm_weight.data_ptr() if norm_weight is not None else None, xa["xq"].data_ptr(), xa["xg"].data_ptr(), xa["xzp"].data_ptr(), M, K,
+    assert acc is None or (acc.dtype == torch.float32 and acc.shape == (M, K) and acc.is_contiguous())
+    lib.w4a8_quant_x(x.data_ptr(), norm_weight.data_ptr() if norm_weight is not None else None, xa["xq"].data_ptr(),
+                     xa["xg"].data_ptr(), xa["xzp"].data_ptr(), acc.data_ptr() if acc is not None else None, M, K,
                      torch.cuda.current_stream().cuda_stream)
     return xa
 
@@ -159,14 +162,30 @@ CONFIGS = {
 DEFAULT = [(16, (2, 4))]
 
 
+# gemm(..., acc=): (row tiles per wave, waves, K splits) per (N, K)
+ACC_CONFIGS = {
+    (5120, 17408): [(16, (2, 4, 3))],
+    (5120, 6144): [(16, (2, 4, 3))],
+}
+ACC_DEFAULT = [(16, (2, 4, 2))]
+
+
+def acc_config_for(N, K, M):
+    for m, c in ACC_CONFIGS.get((N, K), ACC_DEFAULT):
+        if M <= m:
+            return c
+
+
 def config_for(N, K, M):
     for m, c in CONFIGS.get((N, K), DEFAULT):
         if M <= m:
             return c
 
 
-def gemm(x, p, out=None, residual=None, cfg=None, xa=None):
-    """x: (M, K) bf16 (quantized here into xa) or an activation dict from quant_x."""
+def gemm(x, p, out=None, residual=None, cfg=None, xa=None, acc=None):
+    """x: (M, K) bf16 (quantized here into xa) or an activation dict from quant_x.
+    acc: fp32 (M, N), zero or holding earlier sums: acc += x @ W^T with K split over workgroups (atomic adds);
+    a later quant_x(..., acc=acc) adds it to the residual stream."""
     lib = _build()
     if isinstance(x, dict):
         xa = x
@@ -177,14 +196,22 @@ def gemm(x, p, out=None, residual=None, cfg=None, xa=None):
     assert K == p["K"] and 1 <= M <= 16
     No = N // 2 if p["swiglu"] else N
     assert residual is None or (not p["swiglu"] and residual.shape == (M, N) and residual.is_contiguous())
-    if out is None:
-        out = torch.empty(M, No, dtype=torch.bfloat16, device=xa["xq"].device)
-    nt, waves = cfg or config_for(N, K, M)
-    assert not (p["swiglu"] and nt % 2) and N % (16 * nt) == 0
+    splits = 1
+    if acc is not None:
+        assert residual is None and out is None and not p["swiglu"] and not p["rms"]
+        assert acc.dtype == torch.float32 and acc.shape == (M, N) and acc.is_contiguous()
+        nt, waves, splits = cfg or acc_config_for(N, K, M)
+        out = acc
+    else:
+        if out is None:
+            out = torch.empty(M, No, dtype=torch.bfloat16, device=xa["xq"].device)
+        nt, waves = cfg or config_for(N, K, M)
+    assert not (p["swiglu"] and nt % 2) and N % (16 * nt) == 0 and splits <= K // 128
     assert nt * (K // 128) * 32 <= 65536
     rc = lib.w4a8_gemm(xa["xq"].data_ptr(), xa["xg"].data_ptr(), xa["xzp"].data_ptr(), p["qw"].data_ptr(),
                        p["msc"].data_ptr(), p["mzp"].data_ptr(), out.data_ptr(),
                        residual.data_ptr() if residual is not None else None, M, N, K, nt, waves,
-                       int(p["rms"]), int(p["swiglu"]), EPS, torch.cuda.current_stream().cuda_stream)
+                       int(p["rms"]), int(p["swiglu"]) | (2 if acc is not None else 0), EPS, splits,
+                       torch.cuda.current_stream().cuda_stream)
     assert rc == 0, "no kernel instance for this configuration"
     return out
