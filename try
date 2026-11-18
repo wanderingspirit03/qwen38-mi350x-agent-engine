@@ -1,0 +1,1 @@
+/opt/ij-amd/amd/controller/bin/ijc
