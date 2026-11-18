@@ -32,10 +32,39 @@ def attn_prefill_ref(q, kc, vc, p0, T):
     return o.transpose(0, 1).reshape(T, HEADS * HEAD_DIM)
 
 
+FP8 = torch.float8_e4m3fn
+FP8_MAX = 448.0
+
+
+class Lin:
+    """A prefill linear layer: bf16 matmul, or fp8 (per-output-channel weight scales, per-row activation scales)."""
+
+    def __init__(self, w, fp8):
+        self.fp8 = fp8
+        if fp8:
+            s = w.float().abs().amax(1, keepdim=True).clamp(min=1e-8) / FP8_MAX
+            self.wq = (w.float() / s).to(FP8)
+            self.ws = s.reshape(1, -1).contiguous()
+        else:
+            self.w = w
+
+    def __call__(self, x, out):
+        if not self.fp8:
+            torch.matmul(x, self.w.t(), out=out)
+            return
+        xs = x.float().abs().amax(1, keepdim=True).clamp(min=1e-8) / FP8_MAX
+        xq = (x.float() / xs).to(FP8)
+        out.copy_(torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.ws, out_dtype=torch.bfloat16))
+
+
 class Prefill:
-    def __init__(self, w, dev="cuda", gdn_chunk=gdn_chunk_ref):
+    def __init__(self, w, dev="cuda", gdn_chunk=gdn_chunk_ref, fp8=False):
         self.w = w
         self.gdn_chunk = gdn_chunk
+        self.lin = []
+        for L in w.layers:
+            self.lin.append({k: Lin(L[k], fp8) for k in ("qkv", "o", "in_proj", "out", "gate_up", "down") if k in L})
+        self.mlin = {k: Lin(w.mtp[k], fp8) for k in ("fc", "qkv", "o", "gate_up", "down")}
         C = CHUNK
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.x = torch.empty(C, HIDDEN, **bf)
@@ -56,18 +85,18 @@ class Prefill:
         self.pos = torch.zeros(1, dtype=torch.int32, device=dev)
         self.nrow = torch.zeros(1, dtype=torch.int32, device=dev)
 
-    def _attn(self, L, li, st, p0, T):
-        torch.matmul(self.h[:T], L["qkv"].t(), out=self.qkv[:T])
+    def _attn(self, L, lin, li, st, p0, T):
+        lin["qkv"](self.h[:T], self.qkv[:T])
         H.attn_prep(self.qkv[:T], L["q_norm"], L["k_norm"], self.pos, self.q[:T], st.k[li], st.v[li])
         gate = self.qkv[:T, :HEADS * 512].view(T, HEADS, 512)[..., HEAD_DIM:]
         attn_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM))
-        torch.matmul(self.ao[:T], L["o"].t(), out=self.d[:T])
+        lin["o"](self.ao[:T], self.d[:T])
 
-    def _mlp(self, L, T):
+    def _mlp(self, L, lin, T):
         H.add_rmsnorm(self.x[:T], self.d[:T], L["post_norm"], self.h[:T])
-        torch.matmul(self.h[:T], L["gate_up"].t(), out=self.gu[:T])
+        lin["gate_up"](self.h[:T], self.gu[:T])
         H.silu_mul(self.gu[:T], self.act[:T])
-        torch.matmul(self.act[:T], L["down"].t(), out=self.d[:T])
+        lin["down"](self.act[:T], self.d[:T])
 
     @torch.inference_mode()
     def chunk(self, ids, p0, st):
@@ -79,20 +108,21 @@ class Prefill:
         ai = gi = 0
         for i, L in enumerate(w.layers):
             H.add_rmsnorm(self.x[:T], None if i == 0 else self.d[:T], L["in_norm"], self.h[:T])
+            lin = self.lin[i]
             if IS_ATTN[i]:
-                self._attn(L, ai, st, p0, T)
+                self._attn(L, lin, ai, st, p0, T)
                 ai += 1
             else:
                 proj = self.proj[:T]
-                torch.matmul(self.h[:T], L["in_proj"].t(), out=proj)
+                lin["in_proj"](self.h[:T], proj)
                 H.gdn_prep(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], self.qk[:T], self.vv[:T],
                            self.gb[:T])
                 o = self.gdn_chunk(self.qk[:T], self.vv[:T], self.gb[:T], st.ssm[gi])
                 H.gated_norm(o, proj, L["gnorm"], self.go[:T])
                 H.conv_update(self.nrow, proj, st.conv[gi])
-                torch.matmul(self.go[:T], L["out"].t(), out=self.d[:T])
+                lin["out"](self.go[:T], self.d[:T])
                 gi += 1
-            self._mlp(L, T)
+            self._mlp(L, lin, T)
         H.add_rmsnorm(self.x[:T], self.d[:T], w.final_norm, self.hn[:T])
         return self.hn[:T]
 
@@ -108,10 +138,10 @@ class Prefill:
         torch.index_select(w.embed, 0, next_ids, out=self.h[:T])
         H.add_rmsnorm(self.h[:T], None, M["pre_emb"], self.mx[:T, :HIDDEN])
         H.add_rmsnorm(hn, None, M["pre_hid"], self.mx[:T, HIDDEN:])
-        torch.matmul(self.mx[:T], M["fc"].t(), out=self.x[:T])
+        self.mlin["fc"](self.mx[:T], self.x[:T])
         H.add_rmsnorm(self.x[:T], None, M["in_norm"], self.h[:T])
-        self._attn(M, 16, st, p0, T)
-        self._mlp(M, T)
+        self._attn(M, self.mlin, 16, st, p0, T)
+        self._mlp(M, self.mlin, T)
         out = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=hn.device)
         H.add_rmsnorm(self.x[T - 1:T], self.d[T - 1:T], M["norm"], out)
         return torch.matmul(out, w.lm_head.t()).float(), out

@@ -22,7 +22,7 @@ class Engine:
         self.st = SeqState(MAX_LEN)
         self.kv = torch.stack([self.st.k, self.st.v])      # (2, 17, MAX_LEN, 4, 256), the working KV
         self.st.k, self.st.v = self.kv[0], self.kv[1]
-        self.pre = Prefill(self.w)
+        self.pre = Prefill(self.w, fp8=os.environ.get("ENG_FP8", "0") == "1")
         self.fast = Fast(self.w, SPEC_K)
         self.graphs = os.environ.get("ENG_GRAPHS", "1") == "1"
         if self.graphs:

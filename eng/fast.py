@@ -9,6 +9,9 @@ Round (all on the device):
   chain    K - 1 single-row MTP steps give d'_2..d'_K
   pos += n, x = y_a
 """
+import os
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -68,6 +71,10 @@ class Fast:
         M = w.mtp
         self.mlin = {k: Linear(M[k]) for k in ("fc", "qkv", "o", "gate_up", "down")}
         self.head = Linear(w.lm_head)
+        # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head
+        dv = np.load(os.path.join(os.path.dirname(__file__), "draft_vocab.npy"))
+        self.dvocab = torch.from_numpy(dv.astype(np.int64)).to(dev)
+        self.dhead = Linear(w.lm_head[self.dvocab].contiguous())
         # GDN per-layer weights stacked for the all-layer commit
         G = [L for i, L in enumerate(w.layers) if not IS_ATTN[i]]
         self.cw = torch.stack([L["conv"] for L in G])
@@ -92,7 +99,7 @@ class Fast:
         self.hn = torch.empty(R, HIDDEN, **bf)          # final-normed hidden (MTP input)
         self.mx = torch.empty(R, 2 * HIDDEN, **bf)
         self.mh = torch.empty(R, HIDDEN, **bf)
-        self.mlogit = torch.empty(1, VOCAB, **bf)
+        self.mlogit = torch.empty(1, len(dv), **bf)
         self.mhn = torch.empty(R, HIDDEN, **bf)
         # round state on the device
         i32 = dict(dtype=torch.int32, device=dev)
@@ -175,8 +182,8 @@ class Fast:
         H.add_rmsnorm(self.x[:R], self.d[:R], M["norm"], self.mh[:R])
         row = self.mh[:R].index_select(0, pick)
         self.mhn[:1].copy_(row)
-        self.head(self.mhn[:1], self.mlogit)
-        return torch.argmax(self.mlogit, -1)
+        self.dhead(self.mhn[:1], self.mlogit)
+        return self.dvocab[torch.argmax(self.mlogit, -1)]
 
     def draft_chain(self, st):
         """vt[1] holds d_1: fill vt[2:] with K - 1 chained MTP drafts (position of x is self.pos)."""
