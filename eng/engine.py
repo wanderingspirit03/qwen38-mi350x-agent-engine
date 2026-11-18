@@ -83,6 +83,8 @@ class Engine:
             t2 = time.monotonic()
             print(f"gen: prompt {n} resumed at {c0} (common {best}); prefill {1e3 * (t1 - t0):.0f} ms, "
                   f"decode {len(r[0])} tokens in {rounds} rounds {1e3 * (t2 - t1):.0f} ms", flush=True)
+            if os.environ.get("ENG_LOG_ROUNDS"):
+                print("rounds:", " ".join(map(str, self.accepted)), flush=True)
         return r
 
     def _decode(self, x, n, ml, mh, max_tokens):
@@ -93,10 +95,10 @@ class Engine:
         F.vt[1:2].copy_(ml.argmax(-1))
         F.g_chain.replay() if self.graphs else F.draft_chain(st)
         out = [x]
-        rounds = 0
+        self.accepted = []
         while not self._done(out, max_tokens):
             F.g_round.replay() if self.graphs else F.round(st)
             res = F.res.tolist()
             out += res[1:1 + res[0]]
-            rounds += 1
-        return out, rounds
+            self.accepted.append(res[0])
+        return out, len(self.accepted)
