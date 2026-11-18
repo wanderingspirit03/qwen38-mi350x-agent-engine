@@ -163,6 +163,13 @@ def main():
         bench(names, Ms, CFGS)
     if mode == "bench":
         bench(names, Ms)
+    if mode == "variants":   # W4A8_PRE="#define A 1;#define B 1": timing of the configured kernels per variant
+        import os
+        for pre in [""] + [v for v in os.environ.get("W4A8_PRE", "").split(";") if v]:
+            w4a8._lib = None
+            w4a8._lib = w4a8._build(pre.replace("\\n", "\n") + "\n" if pre else None)
+            print("variant", pre or "base", flush=True)
+            bench(names, Ms, compare=False)
 
 
 if __name__ == "__main__":

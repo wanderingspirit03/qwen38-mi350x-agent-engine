@@ -122,6 +122,9 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
 
     auto load = [&](Frag<NT>& f, int kb) {
         kb = min(kb, NG - 1);
+#ifdef X_NOLOAD   // experiment: every load hits the same (cached) block
+        kb = 0;
+#endif
 #pragma unroll
         for (int t = 0; t < NT; t++) f.w[t] = __builtin_nontemporal_load(qbase + ((size_t)t * NG + kb) * 64);
         f.xl = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128, 0, 0));
@@ -163,6 +166,10 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     auto mma = [&](const Frag<NT>& f, Pend<NT>& p) {
 #pragma unroll
         for (int t = 0; t < NT; t++) {
+#ifdef X_NOMATH   // experiment: loads only
+            p.a[t] = __builtin_bit_cast(i32x4, f.w[t]) ^ f.xl ^ f.xh;
+            continue;
+#endif
             i32x4 lo, hi;
             deq(f.w[t], lo, hi);
             i32x4 a = MFMA_I8(lo, f.xl, (i32x4){0, 0, 0, 0}, 0, 0, 0);
@@ -175,6 +182,10 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
         if (RMS) ss += p.g.y;
 #pragma unroll
         for (int t = 0; t < NT; t++) {
+#ifdef X_NOMATH
+            acc[t][0] += (float)(p.a[t][0] ^ p.a[t][1] ^ p.a[t][2] ^ p.a[t][3]);
+            continue;
+#endif
             const uint2 sw = *(const uint2*)(ls + ((t * NG + kb) * 16 + lg * 4) * 2);
             const __half2 s01 = __builtin_bit_cast(__half2, sw.x);
             const __half2 s23 = __builtin_bit_cast(__half2, sw.y);
