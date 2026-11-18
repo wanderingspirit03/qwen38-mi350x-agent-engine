@@ -70,25 +70,22 @@ static __device__ __forceinline__ float sum4(float x) {
   return x;
 }
 
+// S_t = d S_{t-1} + k delta^T, delta = (v - d S_{t-1}^T k) beta, o = S_t^T q = d S_{t-1}^T q + (k.q) delta:
+// both dot products with S_{t-1} in one pass, then the update (one reduction per step).
 static __device__ __forceinline__ float delta_step(float* S, const float* q, const float* k, float vv, float g,
-                                                   float beta) {
+                                                   float beta, float kq) {
   float decay = __expf(g);
-  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  float a0 = 0.f, a1 = 0.f, b0 = 0.f, b1 = 0.f;
 #pragma unroll
-  for (int i = 0; i < KP; i += 4) {
-    a0 += S[i] * k[i]; a1 += S[i + 1] * k[i + 1]; a2 += S[i + 2] * k[i + 2]; a3 += S[i + 3] * k[i + 3];
+  for (int i = 0; i < KP; i += 2) {
+    a0 += S[i] * k[i]; a1 += S[i + 1] * k[i + 1];
+    b0 += S[i] * q[i]; b1 += S[i + 1] * q[i + 1];
   }
-  float kv = sum4((a0 + a1) + (a2 + a3));
+  float kv = sum4(a0 + a1), sq = sum4(b0 + b1);
   float delta = (vv - decay * kv) * beta;
-  a0 = a1 = a2 = a3 = 0.f;
 #pragma unroll
-  for (int i = 0; i < KP; i += 4) {
-    S[i] = S[i] * decay + k[i] * delta; a0 += S[i] * q[i];
-    S[i + 1] = S[i + 1] * decay + k[i + 1] * delta; a1 += S[i + 1] * q[i + 1];
-    S[i + 2] = S[i + 2] * decay + k[i + 2] * delta; a2 += S[i + 2] * q[i + 2];
-    S[i + 3] = S[i + 3] * decay + k[i + 3] * delta; a3 += S[i + 3] * q[i + 3];
-  }
-  return sum4((a0 + a1) + (a2 + a3));
+  for (int i = 0; i < KP; i++) S[i] = S[i] * decay + k[i] * delta;
+  return decay * sq + kq * delta;
 }
 
 static __device__ __forceinline__ void load_state(float* S, const float* sp) {
@@ -133,9 +130,18 @@ static __device__ __forceinline__ void run_steps(int n, int h, int vb, const flo
     if (t < n) sv[t][tid & 31] = rv[j];
   }
   if (tid < n) { sg[tid] = rg; sb[tid] = rb; }
+  __shared__ float skq[16][2];
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    if (j < n) {
+      float x = rq[j] * rk[j];
+      for (int m = 32; m > 0; m >>= 1) x += __shfl_xor(x, m);
+      if ((tid & 63) == 0) skq[j][tid >> 6] = x;
+    }
+  }
   __syncthreads();
   for (int t = 0; t < n; t++) {
-    float o = delta_step(S, sq[t][part], sk[t][part], sv[t][lc], sg[t], sb[t]);
+    float o = delta_step(S, sq[t][part], sk[t][part], sv[t][lc], sg[t], sb[t], skq[t][0] + skq[t][1]);
     if (o_out && part == 0) o_out[((size_t)t * NH + h) * DK + col] = o;
   }
   if (state_out) {
