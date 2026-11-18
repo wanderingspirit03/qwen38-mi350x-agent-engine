@@ -83,11 +83,54 @@ lib.gated_norm.argtypes = [I, P, P, I, P, P, P]
 lib.conv_update.argtypes = [P, P, I, P, P]
 
 
+lib.gated_norm_bf16.argtypes = [I, P, P, I, P, P, P]
+
+
 def gated_norm(o, proj, gw, out):
-    """o (T, 48, 128) fp32 -> out (T, 6144) bf16, gated by z = proj[:, 10240:16384]."""
-    _check(lib.gated_norm(o.shape[0], p(o), p(proj), proj.stride(0), p(gw), p(out), stream()), "gated_norm")
+    """o (T, 48, 128) fp32 or bf16 -> out (T, 6144) bf16, gated by z = proj[:, 10240:16384]."""
+    assert o.is_contiguous() and out.is_contiguous()
+    f = lib.gated_norm_bf16 if o.dtype == torch.bfloat16 else lib.gated_norm
+    _check(f(o.shape[0], p(o), p(proj), proj.stride(0), p(gw), p(out), stream()), "gated_norm")
 
 
 def conv_update(n_dev, proj, hist):
     """hist (3, 10240) <- rows n, n+1, n+2 of [hist; proj rows] (n = n_dev[0] = number of proj rows)."""
     _check(lib.conv_update(p(n_dev), p(proj), proj.stride(0), p(hist), stream()), "conv_update")
+
+
+lib.quant_fp8.argtypes = [I, I, P, I, P, P, P]
+
+
+def quant_fp8(x, q, sc):
+    """x (R, K) bf16 (K % 8 == 0, rows may be strided) -> q (R, K) float8_e4m3fn, sc (R, 1) fp32 row scales."""
+    assert x.stride(1) == 1 and x.shape[1] % 8 == 0 and q.is_contiguous()
+    _check(lib.quant_fp8(x.shape[0], x.shape[1], p(x), x.stride(0), p(q), p(sc), stream()), "quant_fp8")
+
+
+lib.gdn_conv.argtypes = [I, P, I, P, P, P, P, P, P, P]
+
+
+def gdn_conv(proj, hist, cw, aneg, dtb, y, gb):
+    """Prefill: y (T, 10240) bf16 = silu(conv(q|k|v)), raw; gb (T, 2, 48) fp32 = g, beta."""
+    T = proj.shape[0]
+    _check(lib.gdn_conv(T, p(proj), proj.stride(0), p(hist), p(cw), p(aneg), p(dtb), p(y), p(gb), stream()),
+           "gdn_conv")
+
+
+lib.silu_mul_quant.argtypes = [I, I, P, P, P, P]
+
+
+def silu_mul_quant(gu, q, sc):
+    """gu (R, 2I) bf16 contiguous -> q (R, I) fp8 = silu(gate) * up quantized per row, sc (R, 1) fp32."""
+    assert gu.is_contiguous() and q.is_contiguous()
+    _check(lib.silu_mul_quant(gu.shape[0], gu.shape[1] // 2, p(gu), p(q), p(sc), stream()), "silu_mul_quant")
+
+
+lib.add_rmsnorm_q.argtypes = [I, I, P, P, P, P, P, P]
+
+
+def add_rmsnorm_q(x, d, w, q, sc):
+    """add_rmsnorm with the output quantized: x (R, H) contiguous; q (R, H) fp8, sc (R, 1) fp32."""
+    assert x.is_contiguous() and q.is_contiguous() and (d is None or d.is_contiguous())
+    _check(lib.add_rmsnorm_q(x.shape[0], x.shape[1], p(x), P(0) if d is None else p(d), p(w), p(q), p(sc),
+                             stream()), "add_rmsnorm_q")

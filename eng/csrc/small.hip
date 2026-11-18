@@ -106,7 +106,144 @@ __global__ void gate_mul_kernel(bf16* __restrict__ o, const bf16* __restrict__ q
   o[idx] = __float2bfloat16(bf(o[idx]) * (1.f / (1.f + __expf(-g))));
 }
 
+// Row-wise fp8 (e4m3fn) quantization: q = x / s, s = amax(row) / 448. grid R, block 256.
+#include <hip/hip_fp8.h>
+__global__ __launch_bounds__(256) void quant_fp8_kernel(const bf16* __restrict__ x, int K, int xs,
+                                                        __hip_fp8_storage_t* __restrict__ q, float* __restrict__ sc) {
+  __shared__ float red[4];
+  int r = blockIdx.x;
+  const bf16* xr = x + (size_t)r * xs;
+  float m = 0.f;
+  for (int i = threadIdx.x * 8; i < K; i += 256 * 8) {
+    uint4 u = *reinterpret_cast<const uint4*>(xr + i);
+    const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+    for (int j = 0; j < 8; j++) m = fmaxf(m, fabsf(bf(e[j])));
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) red[threadIdx.x >> 6] = m;
+  __syncthreads();
+  m = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+  float s = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / s;
+  if (threadIdx.x == 0) sc[r] = s;
+  __hip_fp8_storage_t* qr = q + (size_t)r * K;
+  for (int i = threadIdx.x * 8; i < K; i += 256 * 8) {
+    uint4 u = *reinterpret_cast<const uint4*>(xr + i);
+    const bf16* e = reinterpret_cast<const bf16*>(&u);
+    uint2 o;
+    __hip_fp8_storage_t* ob = reinterpret_cast<__hip_fp8_storage_t*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; j++) ob[j] = __hip_cvt_float_to_fp8(bf(e[j]) * inv, __HIP_SATFINITE, __HIP_E4M3);
+    *reinterpret_cast<uint2*>(qr + i) = o;
+  }
+}
+
+// act = silu(gu[:, :I]) * gu[:, I:] (rounded to bf16 as silu_mul does), quantized to fp8 per row like quant_fp8.
+// grid R, block 512; I % 8 == 0, I <= 512 * 8 * 5.
+__global__ __launch_bounds__(512) void silu_mul_quant_kernel(const bf16* __restrict__ gu, int I,
+                                                              __hip_fp8_storage_t* __restrict__ q,
+                                                              float* __restrict__ sc) {
+  __shared__ float red[8];
+  int r = blockIdx.x, nv = I / 8;
+  const bf16* g = gu + (size_t)r * 2 * I;
+  float a[5][8];
+  float m = 0.f;
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int v = threadIdx.x + k * 512;
+    if (v < nv) {
+      uint4 ug = *reinterpret_cast<const uint4*>(g + v * 8), uu = *reinterpret_cast<const uint4*>(g + I + v * 8);
+      const bf16* eg = reinterpret_cast<const bf16*>(&ug);
+      const bf16* eu = reinterpret_cast<const bf16*>(&uu);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        float x = bf(eg[j]);
+        a[k][j] = rbf(rbf(x / (1.f + __expf(-x))) * bf(eu[j]));
+        m = fmaxf(m, fabsf(a[k][j]));
+      }
+    }
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) red[threadIdx.x >> 6] = m;
+  __syncthreads();
+#pragma unroll
+  for (int k = 0; k < 8; k++) m = fmaxf(m, red[k]);
+  float s = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / s;
+  if (threadIdx.x == 0) sc[r] = s;
+  __hip_fp8_storage_t* qr = q + (size_t)r * I;
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int v = threadIdx.x + k * 512;
+    if (v < nv) {
+      uint2 o;
+      __hip_fp8_storage_t* ob = reinterpret_cast<__hip_fp8_storage_t*>(&o);
+#pragma unroll
+      for (int j = 0; j < 8; j++) ob[j] = __hip_cvt_float_to_fp8(a[k][j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+      *reinterpret_cast<uint2*>(qr + v * 8) = o;
+    }
+  }
+}
+
+// add_rmsnorm with the normed row quantized to fp8 (as quant_fp8): q (R, H) e4m3, sc (R) row scales.
+__global__ __launch_bounds__(256) void add_rmsnorm_q_kernel(bf16* __restrict__ x, const bf16* __restrict__ d,
+                                                            const bf16* __restrict__ w,
+                                                            __hip_fp8_storage_t* __restrict__ q,
+                                                            float* __restrict__ sc, int H) {
+  __shared__ float red[4];
+  __shared__ float redm[4];
+  int r = blockIdx.x;
+  x += (size_t)r * H;
+  float v[20];
+  float s = 0.f;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    float a = 0.f;
+    if (i < H) {
+      a = bf(x[i]);
+      if (d) {
+        a = rbf(a + bf(d[(size_t)r * H + i]));
+        x[i] = __float2bfloat16(a);
+      }
+    }
+    v[j] = a;
+    s += a * a;
+  }
+  float tot = block_sum<256>(s, red);
+  float rs = rsqrtf(tot / H + 1e-6f);
+  float m = 0.f;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    v[j] = i < H ? rbf(v[j] * rs * (1.f + bf(w[i]))) : 0.f;
+    m = fmaxf(m, fabsf(v[j]));
+  }
+  for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if ((threadIdx.x & 63) == 0) redm[threadIdx.x >> 6] = m;
+  __syncthreads();
+  m = fmaxf(fmaxf(redm[0], redm[1]), fmaxf(redm[2], redm[3]));
+  float sv = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / sv;
+  if (threadIdx.x == 0) sc[r] = sv;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    if (i < H) q[(size_t)r * H + i] = __hip_cvt_float_to_fp8(v[j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+  }
+}
+
 extern "C" {
+int add_rmsnorm_q(int R, int H, void* x, const void* d, const void* w, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(add_rmsnorm_q_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
+                     (__hip_fp8_storage_t*)q, (float*)sc, H);
+  return (int)hipGetLastError();
+}
+int silu_mul_quant(int R, int I, const void* gu, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(silu_mul_quant_kernel, dim3(R), dim3(512), 0, s, (const bf16*)gu, I, (__hip_fp8_storage_t*)q,
+                     (float*)sc);
+  return (int)hipGetLastError();
+}
+int quant_fp8(int R, int K, const void* x, int xs, void* q, void* sc, hipStream_t s) {
+  hipLaunchKernelGGL(quant_fp8_kernel, dim3(R), dim3(256), 0, s, (const bf16*)x, K, xs, (__hip_fp8_storage_t*)q,
+                     (float*)sc);
+  return (int)hipGetLastError();
+}
 int add_rmsnorm(int R, int H, void* x, const void* d, const void* w, void* out, int xs, int os, hipStream_t s) {
   hipLaunchKernelGGL(add_rmsnorm_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
                      (bf16*)out, H, xs, os);

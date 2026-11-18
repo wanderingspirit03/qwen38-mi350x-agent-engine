@@ -57,7 +57,7 @@ __global__ void gdn_prep_kernel(const bf16* __restrict__ proj, int pstride, cons
 
 // The value column of a thread group of 4: thread part p holds S[k] for k in [32p, 32p + 32).
 #define KP 32
-#define VB 32   // value columns per block (block = VB * 4 threads)
+#define VB 32   // value columns per block (block = VB * 4 threads = DK: the loaders below rely on it)
 static __device__ __forceinline__ float dpp_xor1(float x) {
   return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, true));
 }
@@ -70,25 +70,22 @@ static __device__ __forceinline__ float sum4(float x) {
   return x;
 }
 
+// S_t = d S_{t-1} + k delta^T, delta = (v - d S_{t-1}^T k) beta, o = S_t^T q = d S_{t-1}^T q + (k.q) delta:
+// both dot products with S_{t-1} in one pass, then the update (one reduction per step).
 static __device__ __forceinline__ float delta_step(float* S, const float* q, const float* k, float vv, float g,
-                                                   float beta) {
+                                                   float beta, float kq) {
   float decay = __expf(g);
-  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  float a0 = 0.f, a1 = 0.f, b0 = 0.f, b1 = 0.f;
 #pragma unroll
-  for (int i = 0; i < KP; i += 4) {
-    a0 += S[i] * k[i]; a1 += S[i + 1] * k[i + 1]; a2 += S[i + 2] * k[i + 2]; a3 += S[i + 3] * k[i + 3];
+  for (int i = 0; i < KP; i += 2) {
+    a0 += S[i] * k[i]; a1 += S[i + 1] * k[i + 1];
+    b0 += S[i] * q[i]; b1 += S[i + 1] * q[i + 1];
   }
-  float kv = sum4((a0 + a1) + (a2 + a3));
+  float kv = sum4(a0 + a1), sq = sum4(b0 + b1);
   float delta = (vv - decay * kv) * beta;
-  a0 = a1 = a2 = a3 = 0.f;
 #pragma unroll
-  for (int i = 0; i < KP; i += 4) {
-    S[i] = S[i] * decay + k[i] * delta; a0 += S[i] * q[i];
-    S[i + 1] = S[i + 1] * decay + k[i + 1] * delta; a1 += S[i + 1] * q[i + 1];
-    S[i + 2] = S[i + 2] * decay + k[i + 2] * delta; a2 += S[i + 2] * q[i + 2];
-    S[i + 3] = S[i + 3] * decay + k[i + 3] * delta; a3 += S[i + 3] * q[i + 3];
-  }
-  return sum4((a0 + a1) + (a2 + a3));
+  for (int i = 0; i < KP; i++) S[i] = S[i] * decay + k[i] * delta;
+  return decay * sq + kq * delta;
 }
 
 static __device__ __forceinline__ void load_state(float* S, const float* sp) {
@@ -107,22 +104,44 @@ static __device__ __forceinline__ void run_steps(int n, int h, int vb, const flo
                                                  const float* __restrict__ state, float* __restrict__ o_out,
                                                  float* __restrict__ state_out) {
   int tid = threadIdx.x, lc = tid >> 2, part = tid & 3, kh = h / 3, col = vb * VB + lc;
-  __shared__ float sq[16][DK], sk[16][DK], sv[16][VB], sg[16], sb[16];
+  // [t][part][36]: the 4 k-parts start 144 bytes apart, on different LDS banks
+  __shared__ __attribute__((aligned(16))) float sq[16][4][36], sk[16][4][36];
+  __shared__ float sv[16][VB], sg[16], sb[16];
   float S[KP];
   load_state(S, state + ((size_t)h * DK + col) * DK + part * KP);
-  for (int i = tid; i < n * DK; i += VB * 4) {
-    int t = i >> 7, c = i & 127;
-    sq[t][c] = qk[(t * 32 + kh) * DK + c];
-    sk[t][c] = qk[(t * 32 + 16 + kh) * DK + c];
+  // issue every load before the first LDS store (one memory latency, not n)
+  float rq[16], rk[16], rv[4];
+#pragma unroll
+  for (int j = 0; j < 16; j++)
+    if (j < n) { rq[j] = qk[(j * 32 + kh) * DK + tid]; rk[j] = qk[(j * 32 + 16 + kh) * DK + tid]; }
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int t = j * 4 + (tid >> 5);
+    if (t < n) rv[j] = v[(t * NH + h) * DK + vb * VB + (tid & 31)];
   }
-  for (int i = tid; i < n * VB; i += VB * 4) {
-    int t = i / VB, c = i % VB;
-    sv[t][c] = v[(t * NH + h) * DK + vb * VB + c];
+  float rg = 0.f, rb = 0.f;
+  if (tid < n) { rg = gb[(tid * 2) * NH + h]; rb = gb[(tid * 2 + 1) * NH + h]; }
+#pragma unroll
+  for (int j = 0; j < 16; j++)
+    if (j < n) { sq[j][tid >> 5][tid & 31] = rq[j]; sk[j][tid >> 5][tid & 31] = rk[j]; }
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int t = j * 4 + (tid >> 5);
+    if (t < n) sv[t][tid & 31] = rv[j];
   }
-  if (tid < n) { sg[tid] = gb[(tid * 2) * NH + h]; sb[tid] = gb[(tid * 2 + 1) * NH + h]; }
+  if (tid < n) { sg[tid] = rg; sb[tid] = rb; }
+  __shared__ float skq[16][2];
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    if (j < n) {
+      float x = rq[j] * rk[j];
+      for (int m = 32; m > 0; m >>= 1) x += __shfl_xor(x, m);
+      if ((tid & 63) == 0) skq[j][tid >> 6] = x;
+    }
+  }
   __syncthreads();
   for (int t = 0; t < n; t++) {
-    float o = delta_step(S, sq[t] + part * KP, sk[t] + part * KP, sv[t][lc], sg[t], sb[t]);
+    float o = delta_step(S, sq[t][part], sk[t][part], sv[t][lc], sg[t], sb[t], skq[t][0] + skq[t][1]);
     if (o_out && part == 0) o_out[((size_t)t * NH + h) * DK + col] = o;
   }
   if (state_out) {
@@ -165,12 +184,13 @@ __global__ void conv_commit_kernel(const int* __restrict__ n_dev, const bf16* __
 }
 
 // prefill: out (T, 6144) bf16 = gated RMSNorm of o (T, 48, 128) fp32 with z from proj. grid (T, 48), block 128.
-__global__ __launch_bounds__(128) void gated_norm_kernel(const float* __restrict__ o, const bf16* __restrict__ proj,
+template <typename TO>
+__global__ __launch_bounds__(128) void gated_norm_kernel(const TO* __restrict__ o, const bf16* __restrict__ proj,
                                                          int pstride, const bf16* __restrict__ gw,
                                                          bf16* __restrict__ out) {
   int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
   __shared__ float red[2];
-  float x = rbf(o[((size_t)t * NH + h) * DK + i]);
+  float x = rbf((float)o[((size_t)t * NH + h) * DK + i]);
   float s = x * x;
   for (int m = 32; m > 0; m >>= 1) s += __shfl_xor(s, m);
   if ((i & 63) == 0) red[i >> 6] = s;
@@ -180,10 +200,49 @@ __global__ __launch_bounds__(128) void gated_norm_kernel(const float* __restrict
   out[(size_t)t * VD + h * DK + i] = __float2bfloat16(rbf(rbf(x * r) * bf(gw[i])) * (z / (1.f + __expf(-z))));
 }
 
+// prefill: y (T, 10240) bf16 = silu(conv) of q|k|v (raw, not normalized); gb (T, 2, 48) = g, beta.
+// grid (T, 81), block 128.
+__global__ void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride, const bf16* __restrict__ hist,
+                                const bf16* __restrict__ cw, const float* __restrict__ aneg,
+                                const float* __restrict__ dtb, bf16* __restrict__ y, float* __restrict__ gb) {
+  int t = blockIdx.x, grp = blockIdx.y, i = threadIdx.x;
+  if (grp == 80) {
+    if (i < NH) {
+      float b = bf(proj[(size_t)t * pstride + NCH + VD + i]);
+      float a = bf(proj[(size_t)t * pstride + NCH + VD + NH + i]);
+      float x = a + dtb[i];
+      float sp = x > 20.f ? x : log1pf(expf(x));
+      gb[(t * 2 + 0) * NH + i] = aneg[i] * sp;
+      gb[(t * 2 + 1) * NH + i] = 1.f / (1.f + expf(-b));
+    }
+    return;
+  }
+  int c = grp * 128 + i;
+  float acc = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    int r = t + j;
+    float xv = r < 3 ? bf(hist[r * NCH + c]) : bf(proj[(size_t)(r - 3) * pstride + c]);
+    acc += xv * bf(cw[c * 4 + j]);
+  }
+  y[(size_t)t * NCH + c] = __float2bfloat16(acc / (1.f + expf(-acc)));
+}
+
 extern "C" {
+int gdn_conv(int T, const void* proj, int pstride, const void* hist, const void* cw, const void* aneg,
+             const void* dtb, void* y, void* gb, hipStream_t s) {
+  hipLaunchKernelGGL(gdn_conv_kernel, dim3(T, 81), dim3(128), 0, s, (const bf16*)proj, pstride, (const bf16*)hist,
+                     (const bf16*)cw, (const float*)aneg, (const float*)dtb, (bf16*)y, (float*)gb);
+  return (int)hipGetLastError();
+}
 int gated_norm(int T, const void* o, const void* proj, int pstride, const void* gw, void* out, hipStream_t s) {
-  hipLaunchKernelGGL(gated_norm_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
+  hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
+  return (int)hipGetLastError();
+}
+int gated_norm_bf16(int T, const void* o, const void* proj, int pstride, const void* gw, void* out, hipStream_t s) {
+  hipLaunchKernelGGL(gated_norm_kernel<bf16>, dim3(T, NH), dim3(128), 0, s, (const bf16*)o, (const bf16*)proj,
+                     pstride, (const bf16*)gw, (bf16*)out);
   return (int)hipGetLastError();
 }
 int conv_update(const void* n_dev, const void* proj, int pstride, void* hist, hipStream_t s) {
@@ -201,7 +260,7 @@ int gdn_verify(int T, const void* qk, const void* v, const void* gb, const void*
                int pstride, const void* gw, void* out, hipStream_t s) {
   hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * 4), 0, s, T, (const float*)qk, (const float*)v,
                      (const float*)gb, (const float*)state, (float*)o);
-  hipLaunchKernelGGL(gated_norm_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
+  hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
   return (int)hipGetLastError();
 }
