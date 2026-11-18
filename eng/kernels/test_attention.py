@@ -126,13 +126,18 @@ def main():
     torch.manual_seed(0)
     ok = True
     print("== correctness: prefill", flush=True)
-    for T, p0, sc in [(1, 0, 1.0), (37, 0, 1.0), (300, 129, 1.0), (1000, 5000, 3.0), (2048, 0, 1.0), (1500, 700, 2.0)]:
+    # T <= 1500 with p0 >= 2048 takes the stream-K path
+    for T, p0, sc in [(1, 0, 1.0), (37, 0, 1.0), (300, 129, 1.0), (1000, 5000, 3.0), (2048, 0, 1.0), (1500, 700, 2.0),
+                      (1, 5000, 1.0), (129, 3000, 1.0), (777, 6400, 2.0), (1500, 12000, 1.0), (4096, 6400, 1.0)]:
         k, v = make_cache(p0 + T, sc)
         q, gate = make_q(T, sc)
         ref = ref_attn(q, k, v, p0 + T)
         ok &= check(f"prefill T={T} p0={p0} qk-scale={sc}", attn_prefill(q, k, v, p0), ref)
-        if T == 300:
+        if T in (300, 777):
             ok &= check("prefill gated", attn_prefill(q, k, v, p0, gate=gate), ref * torch.sigmoid(gate.float()))
+            out = torch.empty(T, HEADS, 2 * HEAD_DIM, dtype=torch.bfloat16, device=dev)[..., :HEAD_DIM]
+            attn_prefill(q, k, v, p0, gate=gate, out=out)
+            ok &= check("prefill gated, strided out", out, ref * torch.sigmoid(gate.float()))
     print("== correctness: decode", flush=True)
     for T, n, sc in [(1, 1, 1.0), (1, 17, 1.0), (4, 4, 1.0), (8, 100, 1.0), (16, 3000, 1.0), (8, 12000, 3.0),
                      (16, 16000, 1.0), (3, 65, 1.0), (12, 777, 2.0), (2, 5000, 1.0)]:
@@ -160,7 +165,8 @@ def main():
     print("ALL OK" if ok else "SOME FAILED", flush=True)
 
     print("== prefill timing (per layer)", flush=True)
-    shapes = [(4096, 6000), (12000, 0), (512, 0), (512, 8000), (2048, 10000), (8192, 4000)]
+    shapes = [(4096, 6400), (12000, 0), (512, 0), (512, 8000), (2048, 10000), (8192, 4000), (1500, 6400), (5600, 6400),
+              (1024, 8192), (300, 12288)]
     if quick:
         shapes = shapes[:1]
     for T, p0 in shapes:

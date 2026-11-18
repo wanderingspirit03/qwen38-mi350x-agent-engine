@@ -1,6 +1,7 @@
 """Full-attention kernels for Qwen3.8-27B (24 query heads, 4 KV heads, head dim 256), batch 1.
 
 attn_prefill(q, k_cache, v_cache, p0)  -> o   causal flash attention for T new positions p0..p0+T-1
+                                              (stream-K schedule when few row blocks see many keys)
 attn_decode(q, k_cache, v_cache, n)    -> o   split-K attention for T <= 16 new positions n-T..n-1;
                                               n is a device int32 tensor (CUDA/HIP-graph safe)
 
@@ -8,6 +9,8 @@ q, o: (T, 24, 256) bf16 (q may be strided; last dim contiguous). k_cache, v_cach
 with the keys/values of all positions < p0 + T (prefill) or < n (decode) already written.
 Query head h uses KV head h // 6; scale 1/16. Optional `gate` (T, 24, 256): o *= sigmoid(gate) (fused).
 """
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -85,10 +88,157 @@ def _prefill_kernel(Q, K, V, O, G, p0, T, NBLK,
              mask=offs_m[:, None] < T)
 
 
+@triton.jit
+def _nblocks(mb, p0, n, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    return (tl.minimum(p0 + (mb + 1) * BLOCK_M, n) + BLOCK_N - 1) // BLOCK_N
+
+
+@triton.jit
+def _prefill_sk_kernel(Q, K, V, O, G, WO, WL, p0, T, NBLK, KTOT, NPROG,
+           sq_t, sq_h, sk_n, sk_h, so_t, so_h, sg_t, sg_h,
+           qk_scale,
+           GROUP: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+           HAS_GATE: tl.constexpr):
+    # Stream-K: the work is KTOT (item, key block) iterations, items = (row block, head), row blocks longest first,
+    # heads in order. Program pid does iterations [lo, hi); an item it does only in part goes to the workspace
+    # (slot 0: its first item, slot 1: its last), merged by _prefill_merge_kernel.
+    pid = tl.program_id(0)
+    lo = pid * KTOT // NPROG
+    hi = (pid + 1) * KTOT // NPROG
+    n = p0 + T
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+    r = 0
+    base = 0
+    nb = _nblocks(NBLK - 1, p0, n, BLOCK_M, BLOCK_N)
+    while base + 24 * nb <= lo:
+        base += 24 * nb
+        r += 1
+        nb = _nblocks(NBLK - 1 - r, p0, n, BLOCK_M, BLOCK_N)
+    it = lo
+    while it < hi:
+        h = (it - base) // nb
+        ibase = base + h * nb
+        kb0 = it - ibase
+        kb1 = tl.minimum(hi - ibase, nb)
+        mb = NBLK - 1 - r
+        g = h // GROUP
+        start = mb * BLOCK_M
+        offs_m = start + tl.arange(0, BLOCK_M)
+        q = tl.load(Q + offs_m[:, None] * sq_t + h * sq_h + offs_d[None, :], mask=offs_m[:, None] < T, other=0.0)
+        kT_ptr = K + g * sk_h + offs_d[:, None] + offs_n[None, :] * sk_n
+        v_ptr = V + g * sk_h + offs_n[:, None] * sk_n + offs_d[None, :]
+        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_M], tl.float32)
+        acc = tl.zeros([BLOCK_M, D], tl.float32)
+        nfull = (p0 + start + 1) // BLOCK_N
+        for j in range(kb0 * BLOCK_N, tl.minimum(kb1, nfull) * BLOCK_N, BLOCK_N):
+            kT = tl.load(kT_ptr + j * sk_n)
+            s = tl.dot(q, kT)
+            m_new = tl.maximum(m_i, tl.max(s, 1) * qk_scale)
+            p = tl.math.exp2(s * qk_scale - m_new[:, None])
+            alpha = tl.math.exp2(m_i - m_new)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(v_ptr + j * sk_n)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            m_i = m_new
+        pos = p0 + offs_m
+        for j in range(tl.maximum(kb0, nfull) * BLOCK_N, kb1 * BLOCK_N, BLOCK_N):
+            kn = j + offs_n
+            kT = tl.load(kT_ptr + j * sk_n, mask=kn[None, :] < n, other=0.0)
+            s = tl.dot(q, kT) * qk_scale
+            s = tl.where(kn[None, :] <= pos[:, None], s, float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            m_use = tl.where(m_new == float("-inf"), 0.0, m_new)    # rows that have seen no key yet
+            p = tl.math.exp2(s - m_use[:, None])
+            alpha = tl.math.exp2(m_i - m_use)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(v_ptr + j * sk_n, mask=kn[:, None] < n, other=0.0)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            m_i = m_new
+        acc = acc / tl.maximum(l_i, 1e-30)[:, None]    # a part may hold rows that see none of its keys
+        if (kb0 == 0) & (kb1 == nb):
+            if HAS_GATE:
+                gt = tl.load(G + offs_m[:, None] * sg_t + h * sg_h + offs_d[None, :], mask=offs_m[:, None] < T,
+                             other=0.0)
+                acc = acc * tl.sigmoid(gt.to(tl.float32))
+            tl.store(O + offs_m[:, None] * so_t + h * so_h + offs_d[None, :], acc.to(O.dtype.element_ty),
+                     mask=offs_m[:, None] < T)
+        else:
+            slot = pid * 2 + (it != lo).to(tl.int32)
+            rows = tl.arange(0, BLOCK_M)
+            tl.store(WO + (slot * BLOCK_M + rows[:, None]) * D + offs_d[None, :], acc)
+            tl.store(WL + slot * BLOCK_M + rows, m_i + tl.math.log2(l_i))
+        it = ibase + kb1
+        if it == base + 24 * nb:
+            base += 24 * nb
+            r += 1
+            nb = _nblocks(NBLK - 1 - r, p0, n, BLOCK_M, BLOCK_N)
+
+
+@triton.jit
+def _prefill_merge_kernel(O, G, WO, WL, p0, T, NBLK, KTOT, NPROG, so_t, so_h, sg_t, sg_h,
+              D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HAS_GATE: tl.constexpr):
+    # one program per item; items done by one program only were written by _prefill_sk_kernel
+    i = tl.program_id(0)
+    r = i // 24
+    h = i % 24
+    n = p0 + T
+    base = 0
+    for rr in range(0, r):
+        base += 24 * _nblocks(NBLK - 1 - rr, p0, n, BLOCK_M, BLOCK_N)
+    nb = _nblocks(NBLK - 1 - r, p0, n, BLOCK_M, BLOCK_N)
+    s0 = base + h * nb
+    s1 = s0 + nb - 1
+    # program containing iteration x: largest p with p * KTOT // NPROG <= x
+    pf = (s0 * NPROG + NPROG - 1) // KTOT
+    pf = tl.where(pf * KTOT // NPROG > s0, pf - 1, pf)
+    pf = tl.where((pf + 1) * KTOT // NPROG <= s0, pf + 1, pf)
+    pl = (s1 * NPROG + NPROG - 1) // KTOT
+    pl = tl.where(pl * KTOT // NPROG > s1, pl - 1, pl)
+    pl = tl.where((pl + 1) * KTOT // NPROG <= s1, pl + 1, pl)
+    if pf == pl:
+        return
+    rows = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    m = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    for p in range(pf, pl + 1):
+        slot = p * 2 + (p * KTOT // NPROG < s0).to(tl.int32)
+        m = tl.maximum(m, tl.load(WL + slot * BLOCK_M + rows))
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+    den = tl.zeros([BLOCK_M], tl.float32)
+    for p in range(pf, pl + 1):
+        slot = p * 2 + (p * KTOT // NPROG < s0).to(tl.int32)
+        w = tl.math.exp2(tl.load(WL + slot * BLOCK_M + rows) - m)
+        den += w
+        acc += w[:, None] * tl.load(WO + (slot * BLOCK_M + rows[:, None]) * D + offs_d[None, :])
+    acc = acc / den[:, None]
+    offs_m = (NBLK - 1 - r) * BLOCK_M + rows
+    if HAS_GATE:
+        gt = tl.load(G + offs_m[:, None] * sg_t + h * sg_h + offs_d[None, :], mask=offs_m[:, None] < T, other=0.0)
+        acc = acc * tl.sigmoid(gt.to(tl.float32))
+    tl.store(O + offs_m[:, None] * so_t + h * so_h + offs_d[None, :], acc.to(O.dtype.element_ty),
+             mask=offs_m[:, None] < T)
+
+
 def prefill_cfg(T):
     if T <= 1024:          # few row blocks: smaller blocks give more programs
         return dict(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=2)
     return dict(BLOCK_M=128, BLOCK_N=64, num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+
+
+@functools.cache
+def _num_cus(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+_sk_ws = {}
+
+
+def _use_stream_k(T, p0, ncu):
+    # measured: stream-K wins (up to 2.5x) when ceil(T / 128) * 24 items do not fill the CUs much more than once and
+    # the keys are long; it loses on short keys (its merge and workspace cost more than the imbalance)
+    return p0 >= 2048 and triton.cdiv(T, 128) * HEADS <= 1.2 * ncu
 
 
 def attn_prefill(q, k_cache, v_cache, p0, gate=None, out=None, cfg=None):
@@ -96,13 +246,33 @@ def attn_prefill(q, k_cache, v_cache, p0, gate=None, out=None, cfg=None):
     T = q.shape[0]
     assert q.shape[1:] == (HEADS, HEAD_DIM) and q.stride(2) == 1 and k_cache.stride(2) == 1
     assert k_cache.stride() == v_cache.stride()
-    cfg = dict(prefill_cfg(T), **(cfg or {}))
     o = torch.empty(T, HEADS, HEAD_DIM, dtype=q.dtype, device=q.device) if out is None else out
     gt = gate if gate is not None else o
+    p0 = int(p0)
+    ncu = _num_cus(q.device)
+    if cfg is None and _use_stream_k(T, p0, ncu):
+        BM, BN = 128, 64
+        nblk = triton.cdiv(T, BM)
+        n = p0 + T
+        ktot = HEADS * sum(triton.cdiv(min(p0 + (mb + 1) * BM, n), BN) for mb in range(nblk))
+        if q.device not in _sk_ws:
+            _sk_ws[q.device] = (torch.empty(ncu * 2, BM, HEAD_DIM, dtype=torch.float32, device=q.device),
+                                torch.empty(ncu * 2, BM, dtype=torch.float32, device=q.device))
+        wo, wl = _sk_ws[q.device]
+        _prefill_sk_kernel[(ncu,)](
+            q, k_cache, v_cache, o, gt, wo, wl, p0, T, nblk, ktot, ncu,
+            q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), o.stride(0), o.stride(1),
+            gt.stride(0), gt.stride(1), SCALE * LOG2E, GROUP=GROUP, D=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN,
+            HAS_GATE=gate is not None, num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+        _prefill_merge_kernel[(nblk * HEADS,)](
+            o, gt, wo, wl, p0, T, nblk, ktot, ncu, o.stride(0), o.stride(1), gt.stride(0), gt.stride(1),
+            D=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BN, HAS_GATE=gate is not None, num_warps=8)
+        return o
+    cfg = dict(prefill_cfg(T), **(cfg or {}))
     nblk = triton.cdiv(T, cfg["BLOCK_M"])
     extra = {k: v for k, v in cfg.items() if k not in ("BLOCK_M", "BLOCK_N")}
     _prefill_kernel[(triton.cdiv(nblk, 2) * 2 * HEADS,)](
-        q, k_cache, v_cache, o, gt, int(p0), T, nblk,
+        q, k_cache, v_cache, o, gt, p0, T, nblk,
         q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), o.stride(0), o.stride(1),
         gt.stride(0), gt.stride(1), SCALE * LOG2E,
         GROUP=GROUP, D=HEAD_DIM, BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"],
