@@ -131,7 +131,7 @@ lib.add_rmsnorm_q.argtypes = [I, I, P, P, P, P, P, P]
 
 def add_rmsnorm_q(x, d, w, q, sc):
     """add_rmsnorm with the output quantized: x (R, H) contiguous; q (R, H) fp8, sc (R, 1) fp32."""
-    assert x.is_contiguous() and q.is_contiguous() and (d is None or d.is_contiguous())
+    assert x.is_contiguous() and q.is_contiguous() and (d is None or d.is_contiguous()) and x.shape[1] == 5120
     _check(lib.add_rmsnorm_q(x.shape[0], x.shape[1], p(x), P(0) if d is None else p(d), p(w), p(q), p(sc),
                              stream()), "add_rmsnorm_q")
 

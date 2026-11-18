@@ -185,46 +185,68 @@ __global__ __launch_bounds__(512) void silu_mul_quant_kernel(const bf16* __restr
 }
 
 // add_rmsnorm with the normed row quantized to fp8 (as quant_fp8): q (R, H) e4m3, sc (R) row scales.
-__global__ __launch_bounds__(256) void add_rmsnorm_q_kernel(bf16* __restrict__ x, const bf16* __restrict__ d,
+// grid R, block 128; H = 5120: 5 vectors of 8 per thread.
+__global__ __launch_bounds__(128) void add_rmsnorm_q_kernel(bf16* __restrict__ x, const bf16* __restrict__ d,
                                                             const bf16* __restrict__ w,
                                                             __hip_fp8_storage_t* __restrict__ q,
                                                             float* __restrict__ sc, int H) {
-  __shared__ float red[4];
-  __shared__ float redm[4];
+  __shared__ float red[2];
+  __shared__ float redm[2];
   int r = blockIdx.x;
   x += (size_t)r * H;
-  float v[20];
+  float v[5][8];
   float s = 0.f;
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    float a = 0.f;
-    if (i < H) {
-      a = bf(x[i]);
-      if (d) {
-        a = rbf(a + bf(d[(size_t)r * H + i]));
-        x[i] = __float2bfloat16(a);
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int e = (threadIdx.x + 128 * k) * 8;
+    uint4 ux = *reinterpret_cast<const uint4*>(x + e);
+    const bf16* bx = reinterpret_cast<const bf16*>(&ux);
+    if (d) {
+      uint4 ud = *reinterpret_cast<const uint4*>(d + (size_t)r * H + e);
+      const bf16* bd = reinterpret_cast<const bf16*>(&ud);
+      uint4 uo;
+      bf16* bo = reinterpret_cast<bf16*>(&uo);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        v[k][j] = rbf(bf(bx[j]) + bf(bd[j]));
+        bo[j] = __float2bfloat16(v[k][j]);
       }
+      *reinterpret_cast<uint4*>(x + e) = uo;
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; j++) v[k][j] = bf(bx[j]);
     }
-    v[j] = a;
-    s += a * a;
+#pragma unroll
+    for (int j = 0; j < 8; j++) s += v[k][j] * v[k][j];
   }
-  float tot = block_sum<256>(s, red);
+  float tot = block_sum<128>(s, red);
   float rs = rsqrtf(tot / H + 1e-6f);
   float m = 0.f;
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    v[j] = i < H ? rbf(v[j] * rs * (1.f + bf(w[i]))) : 0.f;
-    m = fmaxf(m, fabsf(v[j]));
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int e = (threadIdx.x + 128 * k) * 8;
+    uint4 uw = *reinterpret_cast<const uint4*>(w + e);
+    const bf16* bw = reinterpret_cast<const bf16*>(&uw);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      v[k][j] = rbf(v[k][j] * rs * (1.f + bf(bw[j])));
+      m = fmaxf(m, fabsf(v[k][j]));
+    }
   }
   for (int o = 32; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
   if ((threadIdx.x & 63) == 0) redm[threadIdx.x >> 6] = m;
   __syncthreads();
-  m = fmaxf(fmaxf(redm[0], redm[1]), fmaxf(redm[2], redm[3]));
+  m = fmaxf(redm[0], redm[1]);
   float sv = fmaxf(m, 1e-8f) / 448.f, inv = 1.f / sv;
   if (threadIdx.x == 0) sc[r] = sv;
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    if (i < H) q[(size_t)r * H + i] = __hip_cvt_float_to_fp8(v[j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+#pragma unroll
+  for (int k = 0; k < 5; k++) {
+    int e = (threadIdx.x + 128 * k) * 8;
+    uint2 o;
+    __hip_fp8_storage_t* ob = reinterpret_cast<__hip_fp8_storage_t*>(&o);
+#pragma unroll
+    for (int j = 0; j < 8; j++) ob[j] = __hip_cvt_float_to_fp8(v[k][j] * inv, __HIP_SATFINITE, __HIP_E4M3);
+    *reinterpret_cast<uint2*>(q + (size_t)r * H + e) = o;
   }
 }
 
@@ -355,7 +377,7 @@ int argmax_rows(int R, int V, int nb, const void* x, const void* map, void* out,
   return (int)hipGetLastError();
 }
 int add_rmsnorm_q(int R, int H, void* x, const void* d, const void* w, void* q, void* sc, hipStream_t s) {
-  hipLaunchKernelGGL(add_rmsnorm_q_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
+  hipLaunchKernelGGL(add_rmsnorm_q_kernel, dim3(R), dim3(128), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
                      (__hip_fp8_storage_t*)q, (float*)sc, H);
   return (int)hipGetLastError();
 }
