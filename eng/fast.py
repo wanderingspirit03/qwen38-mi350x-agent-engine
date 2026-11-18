@@ -61,10 +61,14 @@ class A8Linear:
         self.p = w4a8.quantize(w, norm_weight=norm, swiglu=swiglu)
 
     def __call__(self, x, out, add=False):
-        key = (x.shape[0], x.shape[1], x.device)
-        if key not in A8Linear.xa:
-            A8Linear.xa[key] = w4a8.new_xa(x.shape[0], x.shape[1], x.device)
-        w4a8.gemm(x, self.p, out=out, residual=out if add else None, xa=A8Linear.xa[key])
+        """x: (M, K) bf16, or an already quantized activation dict"""
+        xa = None
+        if not isinstance(x, dict):
+            key = (x.shape[0], x.shape[1], x.device)
+            if key not in A8Linear.xa:
+                A8Linear.xa[key] = w4a8.new_xa(x.shape[0], x.shape[1], x.device)
+            xa = A8Linear.xa[key]
+        w4a8.gemm(x, self.p, out=out, residual=out if add else None, xa=xa)
 
 
 class W8Linear(Linear):
@@ -121,6 +125,8 @@ class Fast:
         self.vv = torch.empty(48, R, 48, 128, dtype=torch.float32, device=dev)
         self.gb = torch.empty(48, R, 2, 48, dtype=torch.float32, device=dev)
         self.go = torch.empty(R, V_DIM, **bf)
+        self.goq = w4a8.new_xa(R, V_DIM, dev)
+        self.aoq = {}                                     # rows -> quantized attention output (W4A8)
         self.ob = torch.empty(R, 48, 128, dtype=torch.float32, device=dev)
         self.qkv = torch.empty(R, 14336, **bf)
         self.q = torch.empty(R, HEADS, HEAD_DIM, **bf)
@@ -176,8 +182,14 @@ class Fast:
                 lin["in_proj"](self.x, proj)
                 H.gdn_prep(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], self.qk[gi], self.vv[gi],
                            self.gb[gi])
-                H.gdn_verify(self.qk[gi], self.vv[gi], self.gb[gi], st.ssm[gi], self.ob, proj, L["gnorm"], self.go)
-                lin["out"](self.go, self.x, add=True)
+                if isinstance(lin["out"], A8Linear):     # the gated norm quantizes its output for the GEMM
+                    H.gdn_verify_q(self.qk[gi], self.vv[gi], self.gb[gi], st.ssm[gi], self.ob, proj, L["gnorm"],
+                                   self.goq)
+                    lin["out"](self.goq, self.x, add=True)
+                else:
+                    H.gdn_verify(self.qk[gi], self.vv[gi], self.gb[gi], st.ssm[gi], self.ob, proj, L["gnorm"],
+                                 self.go)
+                    lin["out"](self.go, self.x, add=True)
                 gi += 1
             self.mlp(lin, R)
         H.add_rmsnorm(self.x, None, w.final_norm, self.hn)
@@ -195,8 +207,13 @@ class Fast:
         lin["qkv"](self.x[:R], self.qkv[:R])
         H.attn_prep(self.qkv[:R], L["q_norm"], L["k_norm"], pos, self.q[:R], st.k[li], st.v[li])
         gate = self.qkv[:R, :HEADS * 512].view(R, HEADS, 512)[..., HEAD_DIM:]
-        attn_decode(self.q[:R], st.k[li], st.v[li], nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM))
-        lin["o"](self.ao[:R], self.x[:R], add=True)
+        xa = None
+        if isinstance(lin["o"], A8Linear):     # the attention output is quantized for the GEMM by the merge kernel
+            if R not in self.aoq:
+                self.aoq[R] = w4a8.new_xa(R, HEADS * HEAD_DIM, self.x.device)
+            xa = self.aoq[R]
+        attn_decode(self.q[:R], st.k[li], st.v[li], nkv, gate=gate, out=self.ao[:R].view(R, HEADS, HEAD_DIM), xa=xa)
+        lin["o"](self.ao[:R] if xa is None else xa, self.x[:R], add=True)
 
     # ---- acceptance and commit ----
     def accept(self, st):

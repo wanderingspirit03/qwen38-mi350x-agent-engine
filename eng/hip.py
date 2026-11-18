@@ -22,6 +22,7 @@ def stream():
 lib.gdn_prep.argtypes = [I, P, I, P, P, P, P, P, P, P, P]
 lib.gdn_verify.argtypes = [I, P, P, P, P, P, P, I, P, P, P]
 lib.gdn_commit.argtypes = [I, I, P, P, P, P, P, P, I, L, P, P]
+lib.gdn_verify_q.argtypes = [I, P, P, P, P, P, P, I, P, P, P, P, I, P]
 
 
 def _check(rc, name):
@@ -42,6 +43,14 @@ def gdn_verify(qk, v, gb, state, o, proj, gw, out):
     T = proj.shape[0]
     _check(lib.gdn_verify(T, p(qk), p(v), p(gb), p(state), p(o), p(proj), proj.stride(0), p(gw), p(out), stream()),
            "gdn_verify")
+
+
+def gdn_verify_q(qk, v, gb, state, o, proj, gw, xa):
+    """gdn_verify with the output quantized into xa (an eng.kernels.w4a8 activation dict, M = T, K = 6144)."""
+    T = proj.shape[0]
+    assert xa["M"] == T and xa["K"] == 6144
+    _check(lib.gdn_verify_q(T, p(qk), p(v), p(gb), p(state), p(o), p(proj), proj.stride(0), p(gw), p(xa["xq"]),
+                            p(xa["xg"]), p(xa["xzp"]), xa["xzp"].shape[1], stream()), "gdn_verify_q")
 
 
 def gdn_commit(n_dev, qk_all, v_all, gb_all, state_all, proj_all, hist_all):

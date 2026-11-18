@@ -200,6 +200,43 @@ __global__ __launch_bounds__(128) void gated_norm_kernel(const TO* __restrict__ 
   out[(size_t)t * VD + h * DK + i] = __float2bfloat16(rbf(rbf(x * r) * bf(gw[i])) * (z / (1.f + __expf(-z))));
 }
 
+// verify output for the W4A8 out-projection (eng/kernels/w4a8.py activation format): the gated RMSNorm output of
+// one (row, head) is one group of 128, quantized to int8 as w4a8.quant_x does (from the bf16-rounded values).
+// xq (T, 6144) int8, xg (T, 48) float2 (sx / 16, 0), xzp (T, ngp) bf16 = sx * sum(q). grid (T, 48), block 128.
+__global__ __launch_bounds__(128) void gated_norm_q_kernel(const float* __restrict__ o, const bf16* __restrict__ proj,
+                                                           int pstride, const bf16* __restrict__ gw,
+                                                           signed char* __restrict__ xq, float2* __restrict__ xg,
+                                                           bf16* __restrict__ xzp, int ngp) {
+  int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x;
+  __shared__ float red[2];
+  __shared__ int reds[2];
+  float x = rbf(o[((size_t)t * NH + h) * DK + i]);
+  float s = x * x;
+  for (int m = 32; m > 0; m >>= 1) s += __shfl_xor(s, m);
+  if ((i & 63) == 0) red[i >> 6] = s;
+  __syncthreads();
+  float r = rsqrtf((red[0] + red[1]) / 128.f + 1e-6f);
+  float z = bf(proj[(size_t)t * pstride + NCH + h * DK + i]);
+  float v = rbf(rbf(rbf(x * r) * bf(gw[i])) * (z / (1.f + __expf(-z))));
+  float a = fabsf(v);
+  for (int m = 32; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor(a, m));
+  __syncthreads();
+  if ((i & 63) == 0) red[i >> 6] = a;
+  __syncthreads();
+  a = fmaxf(red[0], red[1]);
+  float inv = a > 0.f ? 127.f / a : 0.f;
+  int q = (int)rintf(v * inv);
+  xq[(size_t)t * VD + h * DK + i] = (signed char)q;
+  for (int m = 32; m > 0; m >>= 1) q += __shfl_xor(q, m);
+  if ((i & 63) == 0) reds[i >> 6] = q;
+  __syncthreads();
+  if (i == 0) {
+    float sx = a / 127.f;
+    xg[(size_t)t * NH + h] = make_float2(sx / 16.f, 0.f);
+    xzp[(size_t)t * ngp + h] = __float2bfloat16(sx * (float)(reds[0] + reds[1]));
+  }
+}
+
 // prefill: y (T, 10240) bf16 = silu(conv) of q|k|v (raw, not normalized); gb (T, 2, 48) = g, beta.
 // grid (ceil(T / 16), 81), block 128: each thread runs one channel over 16 positions with a sliding window.
 __global__ __launch_bounds__(128) void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride,
@@ -270,6 +307,14 @@ int gdn_verify(int T, const void* qk, const void* v, const void* gb, const void*
                      (const float*)gb, (const float*)state, (float*)o);
   hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
+  return (int)hipGetLastError();
+}
+int gdn_verify_q(int T, const void* qk, const void* v, const void* gb, const void* state, void* o, const void* proj,
+                 int pstride, const void* gw, void* xq, void* xg, void* xzp, int ngp, hipStream_t s) {
+  hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * 4), 0, s, T, (const float*)qk, (const float*)v,
+                     (const float*)gb, (const float*)state, (float*)o);
+  hipLaunchKernelGGL(gated_norm_q_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
+                     (const bf16*)gw, (signed char*)xq, (float2*)xg, (bf16*)xzp, ngp);
   return (int)hipGetLastError();
 }
 int gdn_commit(int L, int Tmax, const void* n_dev, const void* qk, const void* v, const void* gb, void* state,

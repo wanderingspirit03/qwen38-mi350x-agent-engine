@@ -120,6 +120,22 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     const int xoff = m * K + lg * 16;
     const u32x4* qbase = qw + (size_t)tile0 * NG * 64 + lane;
 
+    auto load = [&](Frag<NT>& f, int kb) {
+        kb = min(kb, NG - 1);
+#pragma unroll
+        for (int t = 0; t < NT; t++) f.w[t] = __builtin_nontemporal_load(qbase + ((size_t)t * NG + kb) * 64);
+        f.xl = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128, 0, 0));
+        f.xh = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128 + 64, 0, 0));
+        f.g = __builtin_bit_cast(float2, __builtin_amdgcn_raw_buffer_load_b64(gr, (m * NG + kb) * 8, 0, 0));
+    };
+    // the first two k blocks are requested before anything else
+    Frag<NT> fa, fb;
+    if (wave < NG) {
+        load(fa, wave);
+        load(fb, wave + WAVES);
+    }
+    BAR
+
     // scales of the NT tiles -> LDS (NT * NG * 32 bytes, contiguous in global memory)
     extern __shared__ u32x4 lsc[];
     {
@@ -143,14 +159,6 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
         }
     }
 
-    auto load = [&](Frag<NT>& f, int kb) {
-        kb = min(kb, NG - 1);
-#pragma unroll
-        for (int t = 0; t < NT; t++) f.w[t] = __builtin_nontemporal_load(qbase + ((size_t)t * NG + kb) * 64);
-        f.xl = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128, 0, 0));
-        f.xh = __builtin_bit_cast(i32x4, __builtin_amdgcn_raw_buffer_load_b128(xr, xoff + kb * 128 + 64, 0, 0));
-        f.g = __builtin_bit_cast(float2, __builtin_amdgcn_raw_buffer_load_b64(gr, (m * NG + kb) * 8, 0, 0));
-    };
     const char* ls = (const char*)lsc;
     auto mma = [&](const Frag<NT>& f, Pend<NT>& p) {
 #pragma unroll
@@ -177,13 +185,8 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     };
 
     {
-        Frag<NT> fa, fb;
         Pend<NT> pa, pb;
         int kb = wave;
-        if (kb < NG) {
-            load(fa, kb);
-            load(fb, kb + WAVES);
-        }
         __syncthreads();
         if (kb < NG) {
             BAR

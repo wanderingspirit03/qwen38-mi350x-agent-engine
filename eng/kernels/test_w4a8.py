@@ -50,6 +50,45 @@ def check_all_configs(N=5120, K=6144):
         print(f"vs bf16 rmsnorm + matmul, M={M}: w4a8 fused norm {rel(y1, y0):.4f}, w4 {rel(y4, y0):.4f}", flush=True)
 
 
+def check_gdnq():
+    """eng.hip.gdn_verify_q against gdn_verify + quant_x."""
+    from .. import hip as H
+    from ..fast import PROJ
+    T = 9
+    qk = torch.randn(T, 32, 128, device="cuda") * 0.1
+    v = torch.randn(T, 48, 128, device="cuda")
+    gb = torch.stack([-torch.rand(T, 48, device="cuda"), torch.rand(T, 48, device="cuda")], 1)
+    st = torch.randn(48, 128, 128, device="cuda") * 0.1
+    o = torch.empty(T, 48, 128, device="cuda")
+    proj = torch.randn(T, PROJ, device="cuda").bfloat16()
+    gw = torch.rand(128, device="cuda").bfloat16()
+    out = torch.empty(T, 6144, device="cuda").bfloat16()
+    H.gdn_verify(qk, v, gb, st, o, proj, gw, out)
+    ref = w4a8.quant_x(out)
+    xa = w4a8.new_xa(T, 6144)
+    H.gdn_verify_q(qk, v, gb, st, o, proj, gw, xa)
+    e = [(xa[k].float() - ref[k].float()).abs().max().item() for k in ("xq", "xzp")]
+    e.append((xa["xg"][..., 0] - ref["xg"][..., 0]).abs().max().item() / ref["xg"][..., 0].abs().max().item())
+    print(f"gdn_verify_q vs gdn_verify + quant_x: max diffs xq {e[0]}, xzp {e[1]:.3g}, rel sx {e[2]:.3g}", flush=True)
+
+
+def check_attnq():
+    """attn_decode(xa=...) against attn_decode + quant_x."""
+    from .attention import attn_decode
+    for T in (1, 9):
+        q = torch.randn(T, 24, 256, device="cuda").bfloat16()
+        kc = torch.randn(4096, 4, 256, device="cuda").bfloat16()
+        vc = torch.randn(4096, 4, 256, device="cuda").bfloat16()
+        gate = torch.randn(T, 24, 256, device="cuda").bfloat16()
+        n = torch.tensor([3000], dtype=torch.int32, device="cuda")
+        xa = w4a8.new_xa(T, 6144)
+        o = attn_decode(q, kc, vc, n, gate=gate, xa=xa)
+        ref = w4a8.quant_x(o.reshape(T, 6144))
+        e = [(xa[k].float() - ref[k].float()).abs().max().item() for k in ("xq", "xzp")]
+        e.append((xa["xg"][..., 0] - ref["xg"][..., 0]).abs().max().item() / ref["xg"][..., 0].abs().max().item())
+        print(f"attn_decode xa vs quant_x, T={T}: max diffs xq {e[0]}, xzp {e[1]:.3g}, rel xg {e[2]:.3g}", flush=True)
+
+
 def make_packed(N, K, rms=False, swiglu=False):
     NG = K // 128
     NGp = -(-NG // 32) * 32
@@ -117,6 +156,9 @@ def main():
     print(f"build {time.time() - t:.1f} s", flush=True)
     if mode == "allcfg":
         check_all_configs()
+    if mode == "gdnq":
+        check_gdnq()
+        check_attnq()
     if mode == "tune":
         bench(names, Ms, CFGS)
     if mode == "bench":

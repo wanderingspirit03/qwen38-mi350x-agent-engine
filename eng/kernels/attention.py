@@ -346,8 +346,10 @@ def _decode_split_kernel(Q, K, V, NPTR, OP, LSE, T,
 @triton.jit
 def _decode_merge_kernel(OP, LSE, O, G,
                          so_t, so_h, sg_t, sg_h,
+                         XQ, XG, XZP, NGP,
                          GROUP: tl.constexpr, D: tl.constexpr, ROWS: tl.constexpr,
-                         NSPLIT: tl.constexpr, NSPLIT_P2: tl.constexpr, HAS_GATE: tl.constexpr):
+                         NSPLIT: tl.constexpr, NSPLIT_P2: tl.constexpr, HAS_GATE: tl.constexpr,
+                         QUANT: tl.constexpr):
     r = tl.program_id(0)
     g = tl.program_id(1)
     offs_s = tl.arange(0, NSPLIT_P2)
@@ -365,6 +367,20 @@ def _decode_merge_kernel(OP, LSE, O, G,
     if HAS_GATE:
         o = o * tl.sigmoid(tl.load(G + t * sg_t + h * sg_h + offs_d).to(tl.float32))
     tl.store(O + t * so_t + h * so_h + offs_d, o.to(O.dtype.element_ty))
+    if QUANT:   # int8 per group of 128 for the W4A8 o-projection (eng/kernels/w4a8.py activation format)
+        o2 = tl.reshape(o.to(O.dtype.element_ty).to(tl.float32), (D // 128, 128))
+        amax = tl.max(tl.abs(o2), 1)
+        inv = tl.where(amax > 0, 127.0 / amax, 0.0)
+        q = tl.floor(o2 * inv[:, None] + 0.5)
+        HQ = tl.num_programs(1) * GROUP
+        gi = tl.arange(0, D // 128)
+        offs_q = gi[:, None] * 128 + tl.arange(0, 128)[None, :]
+        tl.store(XQ + t * (HQ * D) + h * D + offs_q, q.to(tl.int8))
+        grp = h * (D // 128) + gi
+        sx = amax / 127.0
+        tl.store(XG + (t * (HQ * D // 128) + grp) * 2, sx / 16.0)
+        tl.store(XG + (t * (HQ * D // 128) + grp) * 2 + 1, sx * 0.0)
+        tl.store(XZP + t * NGP + grp, (sx * tl.sum(q, 1)).to(XZP.dtype.element_ty))
 
 
 def decode_cfg(T):
@@ -387,9 +403,10 @@ def decode_workspace(device, nsplit, rows, dtype):
     return _workspace[key]
 
 
-def attn_decode(q, k_cache, v_cache, n, gate=None, out=None, cfg=None):
+def attn_decode(q, k_cache, v_cache, n, gate=None, out=None, cfg=None, xa=None):
     """q (T, 24, 256) bf16, T <= 16, at positions n-T..n-1; n: int32 device tensor (shape (1,) or ()).
-    Returns o (T, 24, 256) bf16. Graph-safe: no host sync; the launch depends only on T."""
+    Returns o (T, 24, 256) bf16. Graph-safe: no host sync; the launch depends only on T.
+    xa: an eng.kernels.w4a8 activation dict (M = T, K = 6144) that also receives o quantized to int8."""
     T = q.shape[0]
     assert 1 <= T <= 16 and q.shape[1:] == (HEADS, HEAD_DIM) and q.stride(2) == 1
     assert k_cache.stride() == v_cache.stride() and k_cache.stride(2) == 1
@@ -408,6 +425,7 @@ def attn_decode(q, k_cache, v_cache, n, gate=None, out=None, cfg=None):
         GROUP=GROUP, D=HEAD_DIM, BLOCK_M=BM, BLOCK_N=BLOCK_N, NSPLIT=NSPLIT, NRB=NRB, ROWS=rows, **cfg)
     _decode_merge_kernel[(T * GROUP, KV_HEADS)](
         op, lse, o, gt, o.stride(0), o.stride(1), gt.stride(0), gt.stride(1),
+        *((xa["xq"], xa["xg"], xa["xzp"], xa["xzp"].shape[1]) if xa is not None else (o, o, o, 0)),
         GROUP=GROUP, D=HEAD_DIM, ROWS=rows, NSPLIT=NSPLIT, NSPLIT_P2=triton.next_power_of_2(NSPLIT),
-        HAS_GATE=gate is not None, num_warps=4)
+        HAS_GATE=gate is not None, QUANT=xa is not None, num_warps=4)
     return o
