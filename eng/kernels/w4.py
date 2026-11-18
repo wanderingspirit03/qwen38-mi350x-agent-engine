@@ -154,12 +154,14 @@ def _workspace(device):
 # Configurations: (row tiles of 16 per wave, waves per workgroup, k splits), tuned on MI350X per (N, K) as a
 # list of (largest M, config). Other shapes get DEFAULT.
 CONFIGS = {
-    (34816, 5120): [(2, (2, 4, 1)), (4, (2, 2, 1)), (8, (4, 4, 1)), (16, (4, 2, 1))],   # MLP gate+up
+    (34816, 5120): [(2, (2, 4, 1)), (4, (2, 2, 1)), (12, (4, 4, 1)), (16, (4, 2, 1))],  # MLP gate+up
     (5120, 17408): [(16, (2, 8, 1))],                                                 # MLP down
     (16480, 5120): [(4, (2, 4, 1)), (16, (2, 2, 1))],                                 # GDN in_proj
-    (5120, 6144): [(8, (2, 8, 1)), (16, (2, 4, 1))],                                  # GDN / attention out
+    (5120, 6144): [(12, (2, 8, 1)), (16, (2, 4, 1))],                                 # GDN / attention out
     (14336, 5120): [(16, (4, 4, 1))],                                                 # attention q+gate,k,v
-    (248320, 5120): [(4, (4, 1, 1)), (16, (8, 1, 1))],                                # LM head
+    (248320, 5120): [(4, (2, 1, 1)), (12, (4, 1, 1)), (16, (8, 1, 1))],               # LM head
+    (5120, 10240): [(16, (2, 8, 1))],                                                 # MTP fc
+    (32768, 5120): [(4, (2, 8, 1)), (16, (4, 4, 1))],                                 # draft head
 }
 DEFAULT = [(4, (2, 4, 1)), (16, (2, 2, 1))]
 

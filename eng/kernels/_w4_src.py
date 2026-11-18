@@ -170,7 +170,9 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
     for (int t = 0; t < NA; t++) acc[t] = f32x4{0.f, 0.f, 0.f, 0.f};
 
     const bool mok = m < M;
-    const __bf16* xrow = x + (size_t)(mok ? m : 0) * K + lg * 8;
+    // x through a buffer whose range ends at row M: lanes of rows m >= M read zeros and no memory
+    const __amdgpu_buffer_rsrc_t xrsrc = __builtin_amdgcn_make_buffer_rsrc((void*)x, 0, M * K * 2, 0x00020000);
+    const int xoff = (m * K + lg * 8) * 2;
     const u32x4* qbase = qw + (size_t)tile0 * KB * 64 + lane;
     // meta records of tiles tile0.. for groups [kb0 GPB, kb1 GPB) -> LDS, 3 x 16 bytes per record
     extern __shared__ u32x4 lmeta[];
@@ -188,7 +190,8 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
 #pragma unroll
         for (int t = 0; t < NT; t++) f.w[t] = ldw<NTL>(qbase + ((size_t)t * KB + kb) * 64);
 #pragma unroll
-        for (int s = 0; s < 4; s++) f.x[s] = *(const u32x4*)(xrow + kb * 128 + s * 32);
+        for (int s = 0; s < 4; s++)
+            f.x[s] = __builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(xrsrc, xoff + kb * 256 + s * 64, 0, 0));
     };
     const char* lm = (const char*)lmeta;
     auto meta_lds = [&](Pend<NT, GPB>& p, int kb) {

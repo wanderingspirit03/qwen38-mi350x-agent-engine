@@ -27,6 +27,8 @@ SHAPES = {  # name: (N, K, tensors concatenated along N, norm weight)
     "qkv": (14336, 5120, [P + "3.self_attn.q_proj.weight", P + "3.self_attn.k_proj.weight",
                           P + "3.self_attn.v_proj.weight"], P + "3.input_layernorm.weight"),
     "lm_head": (248320, 5120, ["lm_head.weight"], "model.language_model.norm.weight"),
+    "mtp_fc": (5120, 10240, None, None),         # benchmark only (random weights)
+    "dhead": (32768, 5120, None, None),
 }
 MS = (1, 2, 4, 8, 16)
 
@@ -57,25 +59,24 @@ def check_all_configs(N=5120, K=6144):
                 r = torch.randn(M, N, device="cuda").bfloat16()
                 yr = w4.reference(x, p)
                 yrr = w4.reference(x, p, residual=r)
-                for nt in (1, 2, 4, 8):
-                    for waves in (1, 2, 4, 8, 16):
-                        for ks in (1, 3):
-                            cfg = (nt, waves, ks)
-                            if ((waves == 16 and nt > 2) or (swiglu and nt % 2)
-                                    or w4.lds_bytes(nt, ks, K, G) > 65536):
-                                continue
-                            y = w4.gemm(x, p, cfg=cfg)
-                            e = rel(y, yr)
-                            e2 = 0
-                            if not swiglu:   # in-place residual
-                                rr = r.clone()
-                                w4.gemm(x, p, out=rr, residual=rr, cfg=cfg)
-                                e2 = rel(rr, yrr)
-                            n += 1
-                            if not (e < 5e-3 and e2 < 5e-3):
-                                bad += 1
-                                print(f"FAIL G={G} rms={rms} swiglu={swiglu} M={M} cfg={cfg} err {e:.3e} {e2:.3e}",
-                                      flush=True)
+                cfgs = [(nt, w_, ks) for nt in (1, 2, 4, 8) for w_ in (1, 2, 4, 8, 16) for ks in (1, 3)]
+                for cfg in cfgs:
+                    nt, waves = cfg[:2]
+                    if ((waves == 16 and nt > 2) or (swiglu and nt % 2)
+                            or w4.lds_bytes(nt, cfg[2], K, G) > 65536):
+                        continue
+                    y = w4.gemm(x, p, cfg=cfg)
+                    e = rel(y, yr)
+                    e2 = 0
+                    if not swiglu:   # in-place residual
+                        rr = r.clone()
+                        w4.gemm(x, p, out=rr, residual=rr, cfg=cfg)
+                        e2 = rel(rr, yrr)
+                    n += 1
+                    if not (e < 5e-3 and e2 < 5e-3):
+                        bad += 1
+                        print(f"FAIL G={G} rms={rms} swiglu={swiglu} M={M} cfg={cfg} err {e:.3e} {e2:.3e}",
+                              flush=True)
     print(f"all configs: {bad} failures of {n}", flush=True)
     # the fused path against the plain PyTorch ops of the model, with the unquantized weights as reference:
     # the fused error should be about the plain 4-bit error
@@ -92,6 +93,8 @@ def check_all_configs(N=5120, K=6144):
 def check(names, groups=(128, 64)):
     for name in names:
         N, K, tn, nn = SHAPES[name]
+        if tn is None:
+            continue
         w = load(tn)
         nw = load([nn]) if nn else None
         assert w.shape == (N, K), (name, w.shape)
@@ -195,21 +198,37 @@ TUNE_CFGS = [(nt, w, ks) for nt in (1, 2, 4, 8) for w in (1, 2, 4, 8, 16) for ks
              if not (nt > 2 and w == 16)]
 
 
-def tune(names):
-    res = bench(names, TUNE_CFGS)
+def tune(names, Ms=MS):
+    res = bench(names, TUNE_CFGS, Ms=Ms)
     for name in names:
-        for M in MS:
+        for M in Ms:
             r = sorted((t, c) for (n, m, c), t in res.items() if n == name and m == M)[:4]
             print(name, M, " ".join(f"{c}:{t * 1e6:.1f}" for t, c in r), flush=True)
     return res
 
 
+def variants(pre, names, Ms):
+    """Timing of the tuned base configurations with extra #defines (results may be wrong: timing only)."""
+    cfgs = sorted({c for n in names for m in Ms for c in [w4.config_for(SHAPES[n][0], SHAPES[n][1], m)]}
+                  | {(2, 4, 1), (2, 8, 1), (4, 4, 1), (2, 2, 1)})
+    for v, p in (("base", None), ("variant", pre)):
+        w4._lib = None
+        w4._lib = w4._build(p) if p else w4._build()
+        print("==", v, flush=True)
+        bench(names, cfgs, Ms=Ms)
+    w4._lib = None
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "allcfg"
-    names = sys.argv[2].split(",") if len(sys.argv) > 2 else list(SHAPES)
+    names = sys.argv[2].split(",") if len(sys.argv) > 2 and sys.argv[2] != "all" else list(SHAPES)
+    Ms = tuple(int(v) for v in sys.argv[3].split(",")) if len(sys.argv) > 3 else MS
     pr = torch.cuda.get_device_properties(0)
     print(pr.name, "CUs", pr.multi_processor_count, flush=True)
     t = time.time()
+    pre = os.environ.get("W4_PRE", "").replace("\\n", "\n")
+    if pre and mode != "variants":   # the experiment replaces the kernels for every other mode
+        w4._lib = w4._build(pre)
     w4._build()
     print(f"build {time.time() - t:.1f} s", flush=True)
     if mode == "allcfg":
@@ -217,10 +236,12 @@ def main():
     if mode == "check":
         check(names)
     if mode == "tune":
-        tune(names)
+        tune(names, Ms)
+    if mode == "variants":
+        variants(pre, names, Ms)
     if mode == "bench":
-        bench(names)
-        bench(names, fused=True, Ms=(1, 16))
+        bench(names, Ms=Ms)
+        bench(names, fused=True, Ms=Ms)
 
 
 if __name__ == "__main__":
