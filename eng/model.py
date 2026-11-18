@@ -64,7 +64,19 @@ class Weights:
                 L["gnorm"] = raw.pop(a + "norm.weight")
                 L["out"] = raw.pop(a + "out_proj.weight")
             self.layers.append(L)
-        self.mtp = {k[4:]: raw.pop(k) for k in list(raw) if k.startswith("mtp.")}
+        m = "mtp.layers.0."
+        self.mtp = {"fc": raw.pop("mtp.fc.weight"), "norm": raw.pop("mtp.norm.weight"),
+                    "pre_emb": raw.pop("mtp.pre_fc_norm_embedding.weight"),
+                    "pre_hid": raw.pop("mtp.pre_fc_norm_hidden.weight"),
+                    "in_norm": raw.pop(m + "input_layernorm.weight"),
+                    "post_norm": raw.pop(m + "post_attention_layernorm.weight"),
+                    "gate_up": torch.cat([raw.pop(m + "mlp.gate_proj.weight"), raw.pop(m + "mlp.up_proj.weight")]),
+                    "down": raw.pop(m + "mlp.down_proj.weight"),
+                    "qkv": torch.cat([raw.pop(m + "self_attn.q_proj.weight"), raw.pop(m + "self_attn.k_proj.weight"),
+                                      raw.pop(m + "self_attn.v_proj.weight")]),
+                    "o": raw.pop(m + "self_attn.o_proj.weight"),
+                    "q_norm": raw.pop(m + "self_attn.q_norm.weight"),
+                    "k_norm": raw.pop(m + "self_attn.k_norm.weight")}
         assert not raw, list(raw)[:10]
         print(f"weights loaded in {time.time() - t0:.1f} s", flush=True)
 
@@ -73,8 +85,8 @@ class State:
     """One sequence: attention KV per attention layer, GDN conv history and recurrent state per GDN layer."""
 
     def __init__(self, max_len, device="cuda"):
-        n_attn = sum(IS_ATTN)
-        n_gdn = N_LAYERS - n_attn
+        n_attn = sum(IS_ATTN) + 1          # the last one is the MTP layer's
+        n_gdn = N_LAYERS - sum(IS_ATTN)
         self.k = torch.zeros(n_attn, max_len, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
         self.v = torch.zeros_like(self.k)
         self.conv = torch.zeros(n_gdn, 3, CONV_DIM, dtype=torch.bfloat16, device=device)
@@ -172,3 +184,22 @@ class Model:
         hn = R.rmsnorm(x, W.final_norm)
         sel = hn[-1:] if last_only else hn
         return F.linear(sel, W.lm_head).float(), hn
+
+    @torch.inference_mode()
+    def mtp_forward(self, tokens, hidden, p0, st):
+        """The MTP layer: row i combines the target's (final-normed) hidden state at position p0+i with the
+        embedding of the token at position p0+i+1 and predicts the token at p0+i+2. Returns logits of all rows
+        and the MTP's own normed hidden states (the input for a chained step)."""
+        W, M = self.w, self.w.mtp
+        T = tokens.shape[0]
+        e = R.rmsnorm(W.embed[tokens], M["pre_emb"])
+        h = R.rmsnorm(hidden, M["pre_hid"])
+        x = F.linear(torch.cat([e, h], -1), M["fc"])
+        pos = torch.arange(p0, p0 + T, device=self.device)
+        cos, sin = rope_cos_sin(pos, self.device)
+        x = x + self.attn(M, st.k.shape[0] - 1, R.rmsnorm(x, M["in_norm"]), st, p0, cos, sin)
+        h2 = R.rmsnorm(x, M["post_norm"])
+        gu = F.linear(h2, M["gate_up"])
+        x = x + F.linear(F.silu(gu[:, :INTER]) * gu[:, INTER:], M["down"])
+        hn = R.rmsnorm(x, M["norm"])
+        return F.linear(hn, W.lm_head).float(), hn
