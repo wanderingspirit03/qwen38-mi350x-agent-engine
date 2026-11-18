@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from . import hip as H
+from .kernels import w4 as w4q
 from .kernels.attention import attn_decode
 from .model import (CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, N_LAYERS, V_DIM, VOCAB)
 
@@ -34,14 +35,22 @@ class SeqState:
         self.max_len = max_len
 
 
-class Linear:
-    """Interim: bf16 matmul. To be replaced by the 4-bit kernel."""
+W4 = os.environ.get("ENG_W4", "1") == "1"
+W4_HEAD = os.environ.get("ENG_W4_HEAD", "1") == "1"
 
-    def __init__(self, w):
-        self.w = w
+
+class Linear:
+    """x (M <= 16, K) @ W^T: 4-bit weights (eng.kernels.w4) or bf16 matmul."""
+
+    def __init__(self, w, w4=W4):
+        self.p = w4q.quantize(w) if w4 else None
+        self.w = None if w4 else w
 
     def __call__(self, x, out):
-        torch.matmul(x, self.w.t(), out=out)
+        if self.p is not None:
+            w4q.gemm(x, self.p, out=out)
+        else:
+            torch.matmul(x, self.w.t(), out=out)
 
 
 def attn_decode_ref(q, kc, vc, pos_dev, R):
