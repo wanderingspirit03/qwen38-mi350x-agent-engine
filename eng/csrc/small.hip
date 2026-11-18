@@ -228,7 +228,91 @@ __global__ __launch_bounds__(256) void add_rmsnorm_q_kernel(bf16* __restrict__ x
   }
 }
 
+// out[r] = map[argmax_j x[r, j]] (map optional), first index on ties. grid (R, NB), block 256. Partial maxima go to
+// ws (R * NB u64); the last block of a row (counter cnt[r]) reduces them and resets the counter.
+__device__ __forceinline__ unsigned long long am_key(float v, int j) {
+  unsigned int b = __float_as_uint(v);
+  b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+  return ((unsigned long long)b << 32) | (unsigned int)(0x7fffffff - j);
+}
+__device__ __forceinline__ unsigned long long am_max(unsigned long long a, unsigned long long b) { return a > b ? a : b; }
+__global__ __launch_bounds__(256) void argmax_kernel(const bf16* __restrict__ x, int V, const long long* __restrict__ map,
+                                                     long long* __restrict__ out, unsigned long long* __restrict__ ws,
+                                                     int* __restrict__ cnt) {
+  __shared__ unsigned long long red[4];
+  __shared__ int last;
+  int r = blockIdx.x, nb = gridDim.y, b = blockIdx.y;
+  const bf16* xr = x + (size_t)r * V;
+  int per = ((V + nb - 1) / nb + 7) / 8 * 8;
+  int j0 = b * per, j1 = min(V, j0 + per);
+  unsigned long long best = 0;
+  for (int j = j0 + threadIdx.x * 8; j < j1; j += 256 * 8) {
+    if (j + 8 <= j1) {
+      uint4 u = *reinterpret_cast<const uint4*>(xr + j);
+      const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+      for (int k = 0; k < 8; k++) best = am_max(best, am_key(bf(e[k]), j + k));
+    } else {
+      for (int k = j; k < j1; k++) best = am_max(best, am_key(bf(xr[k]), k));
+    }
+  }
+  for (int o = 32; o > 0; o >>= 1) best = am_max(best, (unsigned long long)__shfl_xor((long long)best, o));
+  if ((threadIdx.x & 63) == 0) red[threadIdx.x >> 6] = best;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    best = am_max(am_max(red[0], red[1]), am_max(red[2], red[3]));
+    ws[r * nb + b] = best;
+    __threadfence();
+    last = atomicAdd(cnt + r, 1) == nb - 1;
+  }
+  __syncthreads();
+  if (!last) return;
+  if (threadIdx.x == 0) {
+    __threadfence();
+    unsigned long long m = 0;
+    for (int i = 0; i < nb; i++) m = am_max(m, __atomic_load_n(ws + r * nb + i, __ATOMIC_RELAXED));
+    int idx = 0x7fffffff - (int)(m & 0xffffffffu);
+    out[r] = map ? map[idx] : idx;
+    cnt[r] = 0;
+  }
+}
+
+// MTP input: mx[r, :H] = rmsnorm(embed[tok[r]]) * (1 + we); mx[r, H:] = rmsnorm(hid[r]) * (1 + wh).
+// grid (R, 2), block 256, H = 5120.
+__global__ __launch_bounds__(256) void mtp_in_kernel(const long long* __restrict__ tok, const bf16* __restrict__ embed,
+                                                     const bf16* __restrict__ hid, int hs, const bf16* __restrict__ we,
+                                                     const bf16* __restrict__ wh, bf16* __restrict__ mx, int H) {
+  __shared__ float red[4];
+  int r = blockIdx.x, part = blockIdx.y;
+  const bf16* x = part == 0 ? embed + (size_t)tok[r] * H : hid + (size_t)r * hs;
+  const bf16* w = part == 0 ? we : wh;
+  bf16* out = mx + (size_t)r * 2 * H + part * H;
+  float v[20];
+  float s = 0.f;
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    v[j] = i < H ? bf(x[i]) : 0.f;
+    s += v[j] * v[j];
+  }
+  float rs = rsqrtf(block_sum<256>(s, red) / H + 1e-6f);
+  for (int j = 0; j < 20; j++) {
+    int i = threadIdx.x + 256 * j;
+    if (i < H) out[i] = __float2bfloat16(v[j] * rs * (1.f + bf(w[i])));
+  }
+}
+
 extern "C" {
+int mtp_in(int R, int H, const void* tok, const void* embed, const void* hid, int hs, const void* we, const void* wh,
+           void* mx, hipStream_t s) {
+  hipLaunchKernelGGL(mtp_in_kernel, dim3(R, 2), dim3(256), 0, s, (const long long*)tok, (const bf16*)embed,
+                     (const bf16*)hid, hs, (const bf16*)we, (const bf16*)wh, (bf16*)mx, H);
+  return (int)hipGetLastError();
+}
+int argmax_rows(int R, int V, int nb, const void* x, const void* map, void* out, void* ws, void* cnt, hipStream_t s) {
+  hipLaunchKernelGGL(argmax_kernel, dim3(R, nb), dim3(256), 0, s, (const bf16*)x, V, (const long long*)map,
+                     (long long*)out, (unsigned long long*)ws, (int*)cnt);
+  return (int)hipGetLastError();
+}
 int add_rmsnorm_q(int R, int H, void* x, const void* d, const void* w, void* q, void* sc, hipStream_t s) {
   hipLaunchKernelGGL(add_rmsnorm_q_kernel, dim3(R), dim3(256), 0, s, (bf16*)x, (const bf16*)d, (const bf16*)w,
                      (__hip_fp8_storage_t*)q, (float*)sc, H);

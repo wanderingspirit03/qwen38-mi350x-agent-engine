@@ -201,38 +201,46 @@ __global__ __launch_bounds__(128) void gated_norm_kernel(const TO* __restrict__ 
 }
 
 // prefill: y (T, 10240) bf16 = silu(conv) of q|k|v (raw, not normalized); gb (T, 2, 48) = g, beta.
-// grid (T, 81), block 128.
-__global__ void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride, const bf16* __restrict__ hist,
-                                const bf16* __restrict__ cw, const float* __restrict__ aneg,
-                                const float* __restrict__ dtb, bf16* __restrict__ y, float* __restrict__ gb) {
-  int t = blockIdx.x, grp = blockIdx.y, i = threadIdx.x;
+// grid (ceil(T / 16), 81), block 128: each thread runs one channel over 16 positions with a sliding window.
+__global__ __launch_bounds__(128) void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride,
+                                                       const bf16* __restrict__ hist, const bf16* __restrict__ cw,
+                                                       const float* __restrict__ aneg, const float* __restrict__ dtb,
+                                                       bf16* __restrict__ y, float* __restrict__ gb, int T) {
+  int t0 = blockIdx.x * 16, grp = blockIdx.y, i = threadIdx.x;
+  int t1 = min(T, t0 + 16);
   if (grp == 80) {
-    if (i < NH) {
-      float b = bf(proj[(size_t)t * pstride + NCH + VD + i]);
-      float a = bf(proj[(size_t)t * pstride + NCH + VD + NH + i]);
-      float x = a + dtb[i];
+    for (int k = i; k < (t1 - t0) * NH; k += 128) {
+      int t = t0 + k / NH, h = k % NH;
+      float b = bf(proj[(size_t)t * pstride + NCH + VD + h]);
+      float a = bf(proj[(size_t)t * pstride + NCH + VD + NH + h]);
+      float x = a + dtb[h];
       float sp = x > 20.f ? x : log1pf(expf(x));
-      gb[(t * 2 + 0) * NH + i] = aneg[i] * sp;
-      gb[(t * 2 + 1) * NH + i] = 1.f / (1.f + expf(-b));
+      gb[(t * 2 + 0) * NH + h] = aneg[h] * sp;
+      gb[(t * 2 + 1) * NH + h] = 1.f / (1.f + expf(-b));
     }
     return;
   }
   int c = grp * 128 + i;
-  float acc = 0.f;
-#pragma unroll
-  for (int j = 0; j < 4; j++) {
-    int r = t + j;
-    float xv = r < 3 ? bf(hist[r * NCH + c]) : bf(proj[(size_t)(r - 3) * pstride + c]);
-    acc += xv * bf(cw[c * 4 + j]);
+  float w0 = bf(cw[c * 4]), w1 = bf(cw[c * 4 + 1]), w2 = bf(cw[c * 4 + 2]), w3 = bf(cw[c * 4 + 3]);
+  auto in = [&](int r) { return r < 3 ? bf(hist[r * NCH + c]) : bf(proj[(size_t)(r - 3) * pstride + c]); };
+  float x0 = in(t0), x1 = in(t0 + 1), x2 = in(t0 + 2);
+  for (int t = t0; t < t1; t++) {
+    float x3 = in(t + 3);
+    float acc = 0.f;
+    acc += x0 * w0;
+    acc += x1 * w1;
+    acc += x2 * w2;
+    acc += x3 * w3;
+    y[(size_t)t * NCH + c] = __float2bfloat16(acc / (1.f + expf(-acc)));
+    x0 = x1; x1 = x2; x2 = x3;
   }
-  y[(size_t)t * NCH + c] = __float2bfloat16(acc / (1.f + expf(-acc)));
 }
 
 extern "C" {
 int gdn_conv(int T, const void* proj, int pstride, const void* hist, const void* cw, const void* aneg,
              const void* dtb, void* y, void* gb, hipStream_t s) {
-  hipLaunchKernelGGL(gdn_conv_kernel, dim3(T, 81), dim3(128), 0, s, (const bf16*)proj, pstride, (const bf16*)hist,
-                     (const bf16*)cw, (const float*)aneg, (const float*)dtb, (bf16*)y, (float*)gb);
+  hipLaunchKernelGGL(gdn_conv_kernel, dim3((T + 15) / 16, 81), dim3(128), 0, s, (const bf16*)proj, pstride,
+                     (const bf16*)hist, (const bf16*)cw, (const float*)aneg, (const float*)dtb, (bf16*)y, (float*)gb, T);
   return (int)hipGetLastError();
 }
 int gated_norm(int T, const void* o, const void* proj, int pstride, const void* gw, void* out, hipStream_t s) {

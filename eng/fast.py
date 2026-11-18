@@ -159,7 +159,7 @@ class Fast:
             self.mlp(lin, R)
         H.add_rmsnorm(self.x, None, w.final_norm, self.hn)
         self.head(self.hn, self.logits)
-        torch.argmax(self.logits, -1, out=self.y)
+        H.argmax_rows(self.logits, self.y)
 
     def attn(self, lin, L, li, st, pos, R):
         lin["qkv"](self.x[:R], self.qkv[:R])
@@ -181,37 +181,35 @@ class Fast:
         H.gdn_commit(self.n_acc, self.qk, self.vv, self.gb, st.ssm, self.proj, st.conv)
 
     # ---- MTP ----
-    def mtp(self, st, tokens, hidden, pos, rows, pick):
+    def mtp(self, st, tokens, hidden, pos, rows, pick, out):
         """The MTP layer on `rows` rows at positions pos.. (row i: target-side hidden at pos+i and the token at
-        pos+i+1). Returns the argmax of row `pick` (device index, shape (1,)) and leaves that row's normed hidden
+        pos+i+1). Writes the draft (argmax of row `pick`) to out (1,) and leaves that row's normed hidden
         in self.mhn[:1]."""
         w, M, R = self.w, self.w.mtp, rows
-        torch.index_select(w.embed, 0, tokens, out=self.mh[:R])
-        H.add_rmsnorm(self.mh[:R], None, M["pre_emb"], self.mx[:R, :HIDDEN])
-        H.add_rmsnorm(hidden, None, M["pre_hid"], self.mx[:R, HIDDEN:])
+        H.mtp_in(tokens, w.embed, hidden, M["pre_emb"], M["pre_hid"], self.mx[:R])
         self.mlin["fc"](self.mx[:R], self.x[:R])
         self.attn(self.mlin, M, 16, st, pos, R)
         self.mlp(self.mlin, R)
-        H.add_rmsnorm(self.x[:R], None, M["norm"], self.mh[:R])
-        row = self.mh[:R].index_select(0, pick)
-        self.mhn[:1].copy_(row)
+        if R == 1:
+            H.add_rmsnorm(self.x[:1], None, M["norm"], self.mhn[:1])
+        else:
+            H.add_rmsnorm(self.x[:R], None, M["norm"], self.mh[:R])
+            self.mhn[:1].copy_(self.mh[:R].index_select(0, pick))
         self.dhead(self.mhn[:1], self.mlogit)
-        return self.dvocab[torch.argmax(self.mlogit, -1)]
+        H.argmax_rows(self.mlogit, out, self.dvocab)
 
     def draft_chain(self, st):
         """vt[1] holds d_1: fill vt[2:] with K - 1 chained MTP drafts (position of x is self.pos)."""
         for j in range(1, self.K):
-            self.mpos.copy_(self.pos + (j - 1))
-            dj = self.mtp(st, self.vt[j:j + 1], self.mhn[:1], self.mpos, 1, self.zero)
-            self.vt[j + 1:j + 2].copy_(dj)
+            torch.add(self.pos, j - 1, out=self.mpos)
+            self.mtp(st, self.vt[j:j + 1], self.mhn[:1], self.mpos, 1, self.zero, self.vt[j + 1:j + 2])
 
     def round(self, st):
         self.verify(st)
         self.accept(st)
         # catch-up: rows i = 0..K: hidden at pos+i, token new[i] at pos+i+1; row a = n_acc - 1 gives d_1
-        d1 = self.mtp(st, self.new, self.hn, self.pos, self.R, self.n_acc.long() - 1)
+        self.mtp(st, self.new, self.hn, self.pos, self.R, self.n_acc.long() - 1, self.vt[1:2])
         self.vt[0:1].copy_(self.new.gather(0, self.n_acc.long() - 1))
-        self.vt[1:2].copy_(d1)
         self.res[0:1].copy_(self.n_acc)
         self.res[1:].copy_(self.new)
         self.pos.add_(self.n_acc)

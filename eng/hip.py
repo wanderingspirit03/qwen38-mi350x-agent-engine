@@ -134,3 +134,30 @@ def add_rmsnorm_q(x, d, w, q, sc):
     assert x.is_contiguous() and q.is_contiguous() and (d is None or d.is_contiguous())
     _check(lib.add_rmsnorm_q(x.shape[0], x.shape[1], p(x), P(0) if d is None else p(d), p(w), p(q), p(sc),
                              stream()), "add_rmsnorm_q")
+
+
+lib.argmax_rows.argtypes = [I, I, I, P, P, P, P, P, P]
+_AM_WS = {}
+
+
+def argmax_rows(x, out, map=None, nb=None):
+    """out (R,) int64 = argmax of each row of x (R, V) bf16 contiguous (first index on ties), through map if given."""
+    R, V = x.shape
+    nb = nb or max(1, min(64, V // 4096))
+    if x.device not in _AM_WS:
+        _AM_WS[x.device] = (torch.empty(16 * 64, dtype=torch.int64, device=x.device),
+                            torch.zeros(16, dtype=torch.int32, device=x.device))
+    ws, cnt = _AM_WS[x.device]
+    assert x.is_contiguous() and R <= 16 and out.dtype == torch.int64
+    _check(lib.argmax_rows(R, V, nb, p(x), P(0) if map is None else p(map), p(out), p(ws), p(cnt), stream()),
+           "argmax_rows")
+
+
+lib.mtp_in.argtypes = [I, I, P, P, P, I, P, P, P, P]
+
+
+def mtp_in(tok, embed, hid, we, wh, mx):
+    """mx (R, 2H) = [rmsnorm(embed[tok]) * (1 + we) | rmsnorm(hid) * (1 + wh)]; tok (R,) int64, hid rows strided."""
+    R, Hd = hid.shape
+    assert tok.dtype == torch.int64 and hid.stride(1) == 1 and mx.is_contiguous()
+    _check(lib.mtp_in(R, Hd, p(tok), p(embed), p(hid), hid.stride(0), p(we), p(wh), p(mx), stream()), "mtp_in")

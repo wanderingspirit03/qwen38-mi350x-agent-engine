@@ -7,7 +7,7 @@ import torch
 from eng.fast import Fast, SeqState
 from eng.model import Weights
 
-K = int(os.environ.get("ENG_SPEC_K", "4"))
+K = int(os.environ.get("ENG_SPEC_K", "8"))
 N = int(os.environ.get("BENCH_POS", "10000"))
 
 
@@ -42,8 +42,8 @@ def main():
     parts = {
         "verify": lambda: F.verify(st),
         "accept+commit": lambda: F.accept(st),
-        "mtp catch-up": lambda: F.mtp(st, F.new, F.hn, F.pos, F.R, F.zero),
-        "mtp 1 row": lambda: F.mtp(st, F.vt[:1], F.mhn[:1], F.mpos, 1, F.zero),
+        "mtp catch-up": lambda: F.mtp(st, F.new, F.hn, F.pos, F.R, F.zero, F.vt[1:2]),
+        "mtp 1 row": lambda: F.mtp(st, F.vt[:1], F.mhn[:1], F.mpos, 1, F.zero, F.vt[1:2]),
     }
     for name, fn in parts.items():
         F.pos.fill_(N)
@@ -57,6 +57,12 @@ def main():
         F.pos.fill_(N)
         F.g_round.replay()
     print(f"whole round (K={K}): {tm(rnd):.3f} ms", flush=True)
+    from torch.profiler import ProfilerActivity, profile
+    F.pos.fill_(N)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        F.round(st)
+        torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30, max_name_column_width=60))
 
 
 if __name__ == "__main__":
