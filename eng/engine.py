@@ -36,7 +36,7 @@ class Engine:
 
     @staticmethod
     def _done(out, max_tokens):
-        for i, t in enumerate(out):
+        for i, t in enumerate(out[:max_tokens]):
             if t in STOP_IDS:
                 return out[:i + 1], "stop"
         if len(out) >= max_tokens:
