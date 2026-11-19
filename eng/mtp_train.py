@@ -132,13 +132,15 @@ class Data:
     def __init__(self, tags):
         sy = store.load("sys.pt")
         self.hs = sy["hn"].cuda()
-        self.seqs = []
+        self.seqs, self.rep = [], []
         for tag in tags:
+            tag, _, rep = tag.partition(":")       # TAG:R = the sequences of TAG R times per epoch
             k = 0
             while (sh := store.load(f"{tag}-{k}.pt")) is not None:
                 for ids, n, hn in zip(sh["ids"], sh["n"], sh["hn"]):
                     if ids.shape[0] - 1 - n >= 2:
                         self.seqs.append((ids.long().cuda(), n, hn.cuda()))
+                        self.rep.append(int(rep or 1))
                 k += 1
         print(f"{','.join(tags)}: {len(self.seqs)} sequences, {sum(s[0].shape[0] - s[1] for s in self.seqs)} answer "
               f"tokens", flush=True)
@@ -225,9 +227,11 @@ def evaluate(M, data, name, D=9):
     print(f"  depth-1 misses {miss.shape[0]} of {m1.shape[0]}: target top-1 prob < 0.5: {(conf < 0.5).float().mean():.2f}, "
           f"0.5-0.9: {((conf >= 0.5) & (conf < 0.9)).float().mean():.2f}, >= 0.9: {(conf >= 0.9).float().mean():.2f}; "
           f"draft token = target's 2nd choice: {(miss[:, 1] == 1).float().mean():.2f}", flush=True)
-    if len(ms) == 96:
-        print(f"  tokens/round first-turn (48) {tokens_per_round(ms[:48]):.3f}, later-turn (48) "
-              f"{tokens_per_round(ms[48:]):.3f}", flush=True)
+    short = [m for m, (S, n, hn) in zip(ms, data.seqs) if n < 9000]
+    long_ = [m for m, (S, n, hn) in zip(ms, data.seqs) if n >= 9000]
+    if short and long_:
+        print(f"  tokens/round prompts < 9000 tokens ({len(short)}) {tokens_per_round(short):.3f}, >= 9000 "
+              f"({len(long_)}) {tokens_per_round(long_):.3f}", flush=True)
     allm = torch.cat(ms).float()
     cond = []
     reach = torch.ones(allm.shape[0], device="cuda", dtype=torch.bool)
@@ -284,7 +288,8 @@ def main():
         return
     params = [p for p in M.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=LR, betas=(0.9, 0.99), weight_decay=0.0)
-    steps = int(epochs * len(tr.seqs) / BATCH)
+    pool = np.repeat(np.arange(len(tr.seqs)), tr.rep)
+    steps = int(epochs * len(pool) / BATCH)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / 30) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps)))))
     step0 = 0
@@ -293,7 +298,7 @@ def main():
         sched.load_state_dict(ck["sched"])
         step0 = ck["step"]
     rng = np.random.default_rng(0)
-    order = np.concatenate([rng.permutation(len(tr.seqs)) for _ in range(int(math.ceil(epochs)) + 1)])
+    order = np.concatenate([rng.permutation(pool) for _ in range(int(math.ceil(epochs)) + 1)])
     t1, tl, tn, tm = time.time(), 0.0, 0, None
     budget = float(os.environ.get("MT_MINUTES", "9")) * 60
     for s in range(step0, steps):
