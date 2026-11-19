@@ -55,7 +55,8 @@ __global__ __launch_bounds__(64 * NW) void gdn_scan_kernel(const bf16* __restric
                                                        const bf16* __restrict__ kdT, const bf16* __restrict__ qn,
                                                        const bf16* __restrict__ Mm, const float* __restrict__ G,
                                                        float* __restrict__ state, long s_h, long s_k, long s_v,
-                                                       bf16* __restrict__ out, long so, int T, int NC, int Tp) {
+                                                       bf16* __restrict__ out, long so, int T, int NC, int Tp,
+                                                       int ck_every, int ck_n, float* __restrict__ ck_out, long ck_s) {
   __shared__ __attribute__((aligned(16))) bf16 lw[2][64 * 128];
   __shared__ __attribute__((aligned(16))) bf16 lk[2][128 * 64];
   __shared__ __attribute__((aligned(16))) bf16 lq[2][64 * 128];
@@ -189,6 +190,18 @@ __global__ __launch_bounds__(64 * NW) void gdn_scan_kernel(const bf16* __restric
     }
   };
 
+  auto store_state = [&](float* dst) {
+#pragma unroll
+    for (int mt = 0; mt < 8; mt++)
+#pragma unroll
+      for (int j = 0; j < 4; j++) dst[h * s_h + (v0 + r) * s_v + (16 * mt + 4 * q + j) * s_k] = S[mt][j];
+  };
+  // checkpoint: the state after n = c + 1 chunks, for n a multiple of ck_every, into slot n / ck_every - 1
+  auto ckpt = [&](int c) {
+    const int n = c + 1;
+    if (ck_every && n % ck_every == 0 && n * SC <= T && n / ck_every <= ck_n) store_state(ck_out + (n / ck_every - 1) * ck_s);
+  };
+
   // Step c: barrier, compute c from LDS buffer c & 1, then u of chunk c + 1, chunk c + 1 (staged in registers
   // during step c - 1) into the other LDS buffer, and the chunk loads of c + 2.
   u32x4 stg[NS];
@@ -200,29 +213,28 @@ __global__ __launch_bounds__(64 * NW) void gdn_scan_kernel(const bf16* __restric
   for (int c = 0; c < NC; c += 2) {
     __syncthreads();
     compute(ua, c, 0);
+    ckpt(c);
     uload(ub, c + 1);
     lstore(stg, 1);
     gload(stg, min(c + 2, NC - 1));
     __syncthreads();
     compute(ub, c + 1, 1);
+    ckpt(c + 1);
     uload(ua, min(c + 2, NC - 1));
     lstore(stg, 0);
     gload(stg, min(c + 3, NC - 1));
   }
-#pragma unroll
-  for (int mt = 0; mt < 8; mt++)
-#pragma unroll
-    for (int j = 0; j < 4; j++) state[h * s_h + (v0 + r) * s_v + (16 * mt + 4 * q + j) * s_k] = S[mt][j];
+  store_state(state);
 }
 
 // nw: waves per workgroup (8, 4 or 2; 8 / nw workgroups per head).
 extern "C" int gdn_scan(int nw, const void* w, const void* uT, const void* kdT, const void* qn, const void* M,
                         const void* G, void* state, long s_h, long s_k, long s_v, void* out, long so, int T, int NC,
-                        int Tp, hipStream_t s) {
+                        int Tp, int ck_every, int ck_n, void* ck_out, long ck_s, hipStream_t s) {
   auto run = [&](auto kern) {
     hipLaunchKernelGGL(kern, dim3(SHV * 8 / nw), dim3(64 * nw), 0, s, (const bf16*)w, (const bf16*)uT,
                        (const bf16*)kdT, (const bf16*)qn, (const bf16*)M, (const float*)G, (float*)state, s_h, s_k,
-                       s_v, (bf16*)out, so, T, NC, Tp);
+                       s_v, (bf16*)out, so, T, NC, Tp, ck_every, ck_n, (float*)ck_out, ck_s);
   };
   if (nw == 8) run(gdn_scan_kernel<8>);
   else if (nw == 4) run(gdn_scan_kernel<4>);

@@ -19,6 +19,7 @@ Semantics: eng.ref_ops.gdn_recurrent. Three kernels over chunks of 64 positions:
      optionally the gated RMSNorm.
 """
 import ctypes
+import os
 
 import torch
 import triton
@@ -32,10 +33,12 @@ HK = 16
 HV = 48
 WY_WARPS = 1
 SCAN_NW = 2   # waves per scan workgroup (8 / SCAN_NW workgroups per head); 2 measured fastest
+WY_HIP = os.environ.get("ENG_WY_HIP", "1") == "1"   # eng/csrc/gdn_wy.hip instead of the Triton _wy_kernel
 
 _lib = _H.lib
+_lib.gdn_wy.argtypes = [ctypes.c_void_p] * 11 + [ctypes.c_int] * 3 + [ctypes.c_long] * 5 + [ctypes.c_float, ctypes.c_void_p]
 _lib.gdn_scan.argtypes = ([ctypes.c_int] + [ctypes.c_void_p] * 7 + [ctypes.c_long] * 3 + [ctypes.c_void_p, ctypes.c_long]
-                          + [ctypes.c_int] * 3 + [ctypes.c_void_p])
+                          + [ctypes.c_int] * 5 + [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p])
 
 
 @triton.jit
@@ -243,7 +246,24 @@ def _gated_norm_kernel(o, z, gw, out, T, sz, so, BT: tl.constexpr, D: tl.constex
     tl.store(out + r[:, None] * so + h * D + d[None, :], (x * (zz / (1. + tl.exp(-zz)))).to(tl.bfloat16), mask=m)
 
 
-def gdn_prefill(q, k, v, g, beta, state, state_kv=False, out=None, z=None, gw=None):
+def wy(q, k, v, g, beta, w, uT, kdT, G, qn, M, T, Tp, NC, hip=True):
+    """The chunk-parallel part: HIP (eng/csrc/gdn_wy.hip) or the Triton _wy_kernel (same outputs)."""
+    if hip:
+        rc = _lib.gdn_wy(q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(), w.data_ptr(),
+                         uT.data_ptr(), kdT.data_ptr(), G.data_ptr(), qn.data_ptr(), M.data_ptr(), T, Tp, NC,
+                         q.stride(0), k.stride(0), v.stride(0), g.stride(0), beta.stride(0), D ** -0.5,
+                         torch.cuda.current_stream().cuda_stream)
+        if rc:
+            raise RuntimeError(f"gdn_wy: hip error {rc}")
+    else:
+        _wy_kernel[(NC, HV)](q, k, v, g, beta, w, uT, kdT, G, qn, M,
+                             T, Tp, q.stride(0), k.stride(0), v.stride(0), g.stride(0), beta.stride(0), D ** -0.5,
+                             D=D, HK=HK, HV=HV, num_warps=WY_WARPS)
+
+
+def gdn_prefill(q, k, v, g, beta, state, state_kv=False, out=None, z=None, gw=None, ckpt=None):
+    """ckpt = (every, ck): also store the state after every, 2 every, ... tokens of this call (every a multiple of
+    64, only positions <= T) into ck[0], ck[1], ... (ck: (n, 48, 128, 128) fp32, inner strides as state)."""
     T = q.shape[0]
     assert q.shape == (T, HK, D) and k.shape == (T, HK, D) and v.shape == (T, HV, D)
     assert g.shape == (T, HV) and beta.shape == (T, HV)
@@ -269,13 +289,16 @@ def gdn_prefill(q, k, v, g, beta, state, state_kv=False, out=None, z=None, gw=No
     G = torch.empty(HV, Tp, device=dev, dtype=torch.float32)
     qn = torch.empty(Tp, HK, D, device=dev, dtype=bf)
     M = torch.empty(NC, HV, C, C, device=dev, dtype=bf)
-    _wy_kernel[(NC, HV)](q, k, v, g, beta, w, uT, kdT, G, qn, M,
-                         T, Tp, q.stride(0), k.stride(0), v.stride(0), g.stride(0), beta.stride(0), D ** -0.5,
-                         D=D, HK=HK, HV=HV, num_warps=WY_WARPS)
+    wy(q, k, v, g, beta, w, uT, kdT, G, qn, M, T, Tp, NC, hip=WY_HIP)
     o = torch.empty(T, HV * D, device=dev, dtype=bf) if gated else out
+    ck_every, ck = (0, None) if ckpt is None else ckpt
+    if ck is not None:
+        assert ck_every % C == 0 and ck.dtype == torch.float32 and ck.shape[1:] == state.shape
+        assert ck.stride()[1:] == state.stride()
     rc = _lib.gdn_scan(SCAN_NW, w.data_ptr(), uT.data_ptr(), kdT.data_ptr(), qn.data_ptr(), M.data_ptr(),
                        G.data_ptr(), state.data_ptr(), state.stride(0), s_k, s_v, o.data_ptr(), o.stride(0), T, NC, Tp,
-                       torch.cuda.current_stream().cuda_stream)
+                       ck_every // C, 0 if ck is None else ck.shape[0], None if ck is None else ck.data_ptr(),
+                       0 if ck is None else ck.stride(0), torch.cuda.current_stream().cuda_stream)
     if rc:
         raise RuntimeError(f"gdn_scan: hip error {rc}")
     if gated:
