@@ -36,6 +36,9 @@ def _build(prefix=None):
     global _lib
     if _lib is not None and prefix is None:
         return _lib
+    wpe = os.environ.get("ENG_GV_WPE")     # experiment: waves per EU of the M = 1 GEMV (0: no attribute)
+    if wpe is not None:
+        prefix = (prefix or "") + f"#define GV_WPE {wpe}\n"
     src_text = (prefix or "") + HIP_SRC
     h = hashlib.sha1(src_text.encode()).hexdigest()[:16]
     d = os.environ.get("ENG_KERNEL_CACHE", "/tmp/eng-kernels")
@@ -52,7 +55,13 @@ def _build(prefix=None):
     lib = ctypes.CDLL(so)
     lib.w4_gemm.restype = ctypes.c_int
     lib.w4_gemm.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 9 + [ctypes.c_float] + [ctypes.c_void_p] * 2)
-    if prefix is None:
+    lib.rd_bench.restype = ctypes.c_int
+    lib.rd_bench.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    lib.w4_gemv_mode.restype = ctypes.c_int
+    lib.w4_gemv_mode.argtypes = ([ctypes.c_void_p] * 5 + [ctypes.c_int] * 8 + [ctypes.c_float] + [ctypes.c_void_p] * 2)
+    lib.w4_gemv.restype = ctypes.c_int
+    lib.w4_gemv.argtypes = ([ctypes.c_void_p] * 5 + [ctypes.c_int] * 9 + [ctypes.c_float] + [ctypes.c_void_p] * 4)
+    if prefix is None or wpe is not None:
         _lib = lib
     return lib
 
@@ -227,6 +236,51 @@ def lds_bytes(nt, ksplit, K, G):
     return nt * -(-(K // 128) // ksplit) * (128 // G) * 48
 
 
+# M = 1 GEMV (w4_gemv_kernel): (row tiles per workgroup, waves, weight ring depth) per (N, K)
+GEMV = os.environ.get("ENG_GEMV", "1") == "1"
+GV_CONFIGS = {    # eng/bench_gv.py, random weights (us: old w4 kernel -> this)
+    (34816, 5120): (2, 4, 2),     # MTP gate+up      27.3 -> 24.6
+    (5120, 17408): (2, 8, 2),     # MTP down         18.3 -> 15.1 (13.8 with i8)
+    (14336, 5120): (2, 4, 1),     # MTP q+gate,k,v   12.7 -> 11.2
+    (5120, 6144): (2, 8, 2),      # MTP o             8.8 -> 6.4
+    (5120, 10240): (2, 8, 2),     # MTP fc           11.0 -> 8.2
+    (33024, 5120): (2, 4, 2),     # draft head (32768 + EXTRA rows)  25.2 -> 23.6
+}
+
+
+GV_I8 = os.environ.get("ENG_GEMV_I8", "0") == "1"
+
+
+def gemv_mode(x, p, out, cfg, mode):
+    """Ablation of w4_gemv_kernel (bf16 x): mode 1 = loads + staging, no math; mode 2 = weight loads only."""
+    lib = _build()
+    N, K = p["N"], p["K"]
+    nt, waves, d = cfg
+    rc = lib.w4_gemv_mode(x.data_ptr(), p["qw"].data_ptr(), p["meta"].data_ptr(), out.data_ptr(), None, N, K, nt, waves,
+                          d, int(p["swiglu"]), int(p["rms"]), mode, EPS, _workspace(x.device)[2].data_ptr(),
+                          torch.cuda.current_stream().cuda_stream)
+    assert rc == 0, f"w4_gemv_mode: no kernel for {(N, K, nt, waves, d, mode)}"
+
+
+def gemv(x, p, out, residual=None, cfg=None, argmax=False, i8=None):
+    """M = 1, G = 128: as gemm(); the streaming GEMV kernel. residual may be out (in place).
+    i8: x quantized to int8 per 128-k block inside the kernel (int8 MFMAs)."""
+    lib = _build()
+    N, K = p["N"], p["K"]
+    cfg = cfg or GV_CONFIGS[(N, K)]
+    nt, waves, d = cfg[:3]
+    sk = cfg[3] if len(cfg) > 3 else 1      # k splits (workgroups per row tiles)
+    assert x.shape == (1, K) and p["G"] == 128 and not p.get("xdup") and not (p["swiglu"] and nt % 2)
+    ws, cnt, am = _workspace(x.device)
+    rc = lib.w4_gemv(x.data_ptr(), p["qw"].data_ptr(), p["meta"].data_ptr(), out.data_ptr(),
+                     residual.data_ptr() if residual is not None else None, N, K, nt, waves, d, sk,
+                     int(p["swiglu"]) | (4 if argmax else 0), int(p["rms"]), int(GV_I8 if i8 is None else i8), EPS,
+                     am.data_ptr(), ws.data_ptr(), cnt.data_ptr(),
+                     torch.cuda.current_stream().cuda_stream)
+    assert rc == 0, f"w4_gemv: no kernel for {(N, K, cfg)} ({rc})"
+    return out
+
+
 def config_for(N, K, M):
     for m, c in CONFIGS.get((N, K), DEFAULT):
         if M <= m:
@@ -250,6 +304,8 @@ def gemm(x, p, out=None, residual=None, cfg=None, argmax=False):
     assert residual is None or (not p["swiglu"] and residual.shape == (M, N) and residual.is_contiguous())
     if out is None:
         out = torch.empty(M, No, dtype=torch.bfloat16, device=x.device)
+    if M == 1 and cfg is None and GEMV and (N, K) in GV_CONFIGS and p["G"] == 128 and not xdup:
+        return gemv(x, p, out, residual, argmax=argmax)
     nt, waves, ksplit = cfg or config_for(N, K, M)
     assert not (p["swiglu"] and nt % 2), "swiglu needs an even number of row tiles per wave"
     assert N % (16 * nt) == 0 and N // (16 * nt) <= 65536 and waves in (1, 2, 4, 8, 16)
