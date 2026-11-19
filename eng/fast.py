@@ -44,6 +44,21 @@ A8_ACC = os.environ.get("ENG_A8_ACC", "1") == "1"     # residual-adding W4A8 GEM
 
 EXTRA = int(os.environ.get("ENG_DRAFT_EXTRA", "256"))   # draft-vocabulary slots for prompt tokens (multiple of 16)
 FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
+# lossy acceptance (see accept_kernel): accept a draft whose target probability is >= tau times the top one
+# (0: exact argmax matches only) and, if ENG_LOSSY_PRICE > 0, whose logit margin is <= price * the tokens it gains
+LOSSY_TAU = float(os.environ.get("ENG_LOSSY_TAU", "0.3"))
+LOSSY_PRICE = float(os.environ.get("ENG_LOSSY_PRICE", "0"))
+
+
+def lossy_params(tau, price=0.0):
+    """[price, cap] for accept_kernel (price 0 there: off)."""
+    if tau <= 0:
+        return [0.0, 0.0]
+    return [price if price > 0 else 1e9, float(np.log(1 / tau))]
+
+
+if LOSSY_TAU > 0:
+    print(f"lossy acceptance: tau {LOSSY_TAU}, price {LOSSY_PRICE}", flush=True)
 _XN = torch.empty(16, 5120, dtype=torch.bfloat16, device="cuda")
 
 
@@ -226,6 +241,7 @@ class Fast:
         self.pos = torch.zeros(1, **i32)                  # position of x
         self.vt = torch.zeros(R, dtype=torch.long, device=dev)   # [x, d_1..d_K]
         self.y = torch.zeros(R, dtype=torch.long, device=dev)
+        self.lossy = torch.tensor(lossy_params(LOSSY_TAU, LOSSY_PRICE) + [0.0, 0.0], device=dev)   # see accept_kernel
         self.n_acc = torch.ones(1, **i32)
         self.new = torch.zeros(R, dtype=torch.long, device=dev)  # the round's new tokens (first n_acc valid)
         self.pick = torch.zeros(1, dtype=torch.long, device=dev)
@@ -318,7 +334,7 @@ class Fast:
 
     # ---- acceptance and commit ----
     def accept(self, st):
-        H.accept(self.vt, self.y, self.n_acc, self.new, self.res, self.pick, self.pos, self.P)
+        H.accept(self.vt, self.y, self.n_acc, self.new, self.res, self.pick, self.pos, self.P, self.logits, self.lossy)
         H.gdn_commit(self.n_acc, self.qk, self.vv, self.gb, st.ssm, self.proj, st.conv)
 
     # ---- MTP ----

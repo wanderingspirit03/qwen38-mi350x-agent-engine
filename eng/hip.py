@@ -183,9 +183,11 @@ def am_decode(am, out, map=None):
     _check(lib.am_decode(p(am), P(0) if map is None else p(map), p(out), stream()), "am_decode")
 
 
-lib.accept.argtypes = [I, P, P, P, P, P, P, P, P, P]
+lib.accept.argtypes = [I, P, P, P, P, P, P, P, P, P, I, P, P]
 
 
-def accept(vt, y, n_acc, new, res, pick, pos, P_):
-    """One round's acceptance and position bookkeeping (see accept_kernel in small.hip)."""
-    _check(lib.accept(vt.shape[0], p(vt), p(y), p(n_acc), p(new), p(res), p(pick), p(pos), p(P_), stream()), "accept")
+def accept(vt, y, n_acc, new, res, pick, pos, P_, logits, lossy):
+    """One round's acceptance and position bookkeeping (see accept_kernel in small.hip). logits (R, V) bf16: the
+    verify logits, read for lossy acceptance; lossy (4,) fp32 [price, cap, margin sum, count]."""
+    _check(lib.accept(vt.shape[0], p(vt), p(y), p(n_acc), p(new), p(res), p(pick), p(pos), p(P_), p(logits),
+                      logits.shape[1], p(lossy), stream()), "accept")
