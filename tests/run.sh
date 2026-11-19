@@ -16,4 +16,4 @@ done
 echo "ready after $(( $(date +%s) - t0 )) s"
 python3 tests/client.py $PORT "$P" "$N" "$MT"
 kill $SP; wait $SP 2>/dev/null
-echo "--- serve log"; tail -40 /tmp/eng-serve.log
+echo "--- serve log"; grep -E '^(gen|rounds):' /tmp/eng-serve.log; tail -5 /tmp/eng-serve.log

@@ -4,4 +4,5 @@ WORKDIR /opt/eng
 COPY eng/csrc /opt/eng/eng/csrc
 RUN chmod -R a+rX /opt/eng && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx950 -shared -fPIC -o /opt/eng/eng/libengk.so eng/csrc/*.hip
 COPY eng /opt/eng/eng
+COPY tests /opt/eng/tests
 RUN chmod -R a+rX /opt/eng

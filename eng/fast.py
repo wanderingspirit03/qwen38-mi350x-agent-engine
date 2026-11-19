@@ -41,6 +41,7 @@ W4A8 = os.environ.get("ENG_W4A8", "1")    # 1: int8-activation GEMMs (eng.kernel
 A8_ACC = os.environ.get("ENG_A8_ACC", "1") == "1"     # residual-adding W4A8 GEMMs split K, sums added by the next quant
 
 
+EXTRA = int(os.environ.get("ENG_DRAFT_EXTRA", "256"))   # draft-vocabulary slots for prompt tokens (multiple of 16)
 FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
 _XN = torch.empty(16, 5120, dtype=torch.bfloat16, device="cuda")
 
@@ -151,10 +152,22 @@ class Fast:
         self.mlin["fc"] = ML(M["fc"])
         HL = {4: Linear, 8: W8Linear, 16: Bf16Linear}[HEAD_BITS]
         self.head = HL(w.lm_head)
-        # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head
+        # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head,
+        # plus EXTRA slots for the prompt's tokens outside that list (set_extra; identifiers copied from the context)
         dv = np.load(os.path.join(os.path.dirname(__file__), "draft_vocab.npy"))
+        self.dv_np = dv.astype(np.int64)
+        self.in_dv = np.zeros(VOCAB, dtype=bool)
+        self.in_dv[dv] = True
+        dv = np.concatenate([dv, np.full(EXTRA, dv[0])])
         self.dvocab = torch.from_numpy(dv.astype(np.int64)).to(dev)
         self.dhead = Linear(w.lm_head[self.dvocab].contiguous())
+        if EXTRA:   # every lm_head row's 4-bit codes, scales and zero points (as quantize() makes them), for set_extra
+            self.hu = torch.empty(VOCAB, HIDDEN // 128, 128, dtype=torch.uint8, device=dev)
+            self.hs = torch.empty(VOCAB, HIDDEN // 128, dtype=torch.float16, device=dev)
+            self.hz = torch.empty(VOCAB, HIDDEN // 128, dtype=torch.uint8, device=dev)
+            for r0 in range(0, VOCAB, 8192):
+                u, s, z = w4q.rtn_search(w.lm_head[r0:r0 + 8192].float().reshape(-1, HIDDEN // 128, 128))
+                self.hu[r0:r0 + 8192], self.hs[r0:r0 + 8192], self.hz[r0:r0 + 8192] = u, s, z
         # GDN per-layer weights stacked for the all-layer commit
         G = [L for i, L in enumerate(w.layers) if not IS_ATTN[i]]
         self.cw = torch.stack([L["conv"] for L in G])
@@ -192,6 +205,21 @@ class Fast:
         self.P = torch.zeros(3 + 2 * K, **i32)
         self.res = torch.zeros(R + 1, dtype=torch.long, device=dev)   # [n_acc, new tokens...]
         self.zero = torch.zeros(1, dtype=torch.long, device=dev)
+
+    def set_extra(self, prompt):
+        """Fill the draft vocabulary's EXTRA slots with the prompt's tokens outside draft_vocab.npy (the most
+        frequent ones if there are more); unused slots repeat dv[0]. prompt: int64 numpy array. Eager."""
+        if not EXTRA:
+            return
+        ids, cnt = np.unique(prompt[~self.in_dv[prompt]], return_counts=True)
+        ids = ids[np.argsort(-cnt, kind="stable")[:EXTRA]]
+        ids = np.concatenate([ids, np.full(EXTRA - len(ids), self.dv_np[0])])
+        t = torch.from_numpy(ids).to(self.dvocab.device)
+        qw, meta = w4q._pack(self.hu[t].int(), self.hs[t].float(), self.hz[t].float())
+        n0 = len(self.dv_np) // 16
+        for k, src in (("qw", qw), ("meta", meta)):
+            self.dhead.p[k].view(self.dhead.p["N"] // 16, -1)[n0:].copy_(src.view(EXTRA // 16, -1))
+        self.dvocab[len(self.dv_np):].copy_(t)
 
     # ---- the target model on R rows ----
     @staticmethod

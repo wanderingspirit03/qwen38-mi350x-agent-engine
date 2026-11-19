@@ -11,7 +11,7 @@ from .model import Weights
 from .prefill import CHUNK, Prefill
 
 STOP_IDS = (248046, 248044)
-SPEC_K = int(os.environ.get("ENG_SPEC_K", "8"))
+SPEC_K = int(os.environ.get("ENG_SPEC_K", "9"))
 MAX_LEN = int(os.environ.get("ENG_MAX_LEN", "24576"))
 CACHE_GB = float(os.environ.get("ENG_CACHE_GB", "80"))
 
@@ -76,6 +76,7 @@ class Engine:
         nxt = torch.cat([ids[s + 1:n], torch.tensor([x], device="cuda")])
         ml, mh = pre.mtp(nxt, hn, s, st)
         self.cache.add(toks, self.kv, ckpts)
+        self.fast.set_extra(toks)
         t1 = time.monotonic()
         out, rounds = self._decode(x, n, ml, mh, max_tokens)
         r = self._done(out, max_tokens)
