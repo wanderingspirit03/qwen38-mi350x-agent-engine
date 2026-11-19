@@ -20,6 +20,32 @@ static __device__ __forceinline__ float block_sum(float s, float* red) {
   return t;
 }
 
+// 5120 bf16 of one row by 256 threads: element 4 (256 j + tid) + e is v[4 j + e]; 5 loads of 8 bytes, all issued
+// before use.
+static __device__ __forceinline__ void load_row5120(const bf16* __restrict__ x, float* v) {
+  uint2 u[5];
+#pragma unroll
+  for (int j = 0; j < 5; j++) u[j] = reinterpret_cast<const uint2*>(x)[256 * j + threadIdx.x];
+#pragma unroll
+  for (int j = 0; j < 5; j++) {
+    v[4 * j] = __uint_as_float(u[j].x << 16);
+    v[4 * j + 1] = __uint_as_float(u[j].x & 0xFFFF0000u);
+    v[4 * j + 2] = __uint_as_float(u[j].y << 16);
+    v[4 * j + 3] = __uint_as_float(u[j].y & 0xFFFF0000u);
+  }
+}
+static __device__ __forceinline__ void store_row5120(bf16* __restrict__ y, const float* v) {
+#pragma unroll
+  for (int j = 0; j < 5; j++) {
+    uint2 u;
+    u.x = (uint32_t)__bfloat16_as_ushort(__float2bfloat16(v[4 * j])) |
+          ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(v[4 * j + 1])) << 16);
+    u.y = (uint32_t)__bfloat16_as_ushort(__float2bfloat16(v[4 * j + 2])) |
+          ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(v[4 * j + 3])) << 16);
+    reinterpret_cast<uint2*>(y)[256 * j + threadIdx.x] = u;
+  }
+}
+
 // x (R, H) bf16; if d: x += d (bf16 rounding, as the reference's residual adds); out = x/rms(x) * (1 + w).
 // grid R, block 256, H = 5120 (20 per thread).
 __global__ __launch_bounds__(256) void add_rmsnorm_kernel(bf16* __restrict__ x, const bf16* __restrict__ d,
@@ -29,27 +55,23 @@ __global__ __launch_bounds__(256) void add_rmsnorm_kernel(bf16* __restrict__ x, 
   int r = blockIdx.x;
   x += (size_t)r * xs;
   out += (size_t)r * os;
-  float v[20];
+  float v[20], wv[20];
+  load_row5120(w, wv);
+  load_row5120(x, v);
+  if (d) {
+    float dv[20];
+    load_row5120(d + (size_t)r * H, dv);
+#pragma unroll
+    for (int j = 0; j < 20; j++) v[j] = rbf(v[j] + dv[j]);
+    store_row5120(x, v);
+  }
   float s = 0.f;
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    float a = 0.f;
-    if (i < H) {
-      a = bf(x[i]);
-      if (d) {
-        a = rbf(a + bf(d[(size_t)r * H + i]));
-        x[i] = __float2bfloat16(a);
-      }
-    }
-    v[j] = a;
-    s += a * a;
-  }
-  float tot = block_sum<256>(s, red);
-  float rs = rsqrtf(tot / H + 1e-6f);
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    if (i < H) out[i] = __float2bfloat16(v[j] * rs * (1.f + bf(w[i])));
-  }
+#pragma unroll
+  for (int j = 0; j < 20; j++) s += v[j] * v[j];
+  float rs = rsqrtf(block_sum<256>(s, red) / H + 1e-6f);
+#pragma unroll
+  for (int j = 0; j < 20; j++) v[j] = v[j] * rs * (1.f + wv[j]);
+  store_row5120(out, v);
 }
 
 // qkv (R, 14336) rows: per query head [q 256 | gate 256] x 24, then k (4 x 256), v (4 x 256).
@@ -309,18 +331,16 @@ __global__ __launch_bounds__(256) void mtp_in_kernel(const long long* __restrict
   const bf16* x = part == 0 ? embed + (size_t)tok[r] * H : hid + (size_t)r * hs;
   const bf16* w = part == 0 ? we : wh;
   bf16* out = mx + (size_t)r * 2 * H + part * H;
-  float v[20];
+  float v[20], wv[20];
+  load_row5120(w, wv);
+  load_row5120(x, v);
   float s = 0.f;
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    v[j] = i < H ? bf(x[i]) : 0.f;
-    s += v[j] * v[j];
-  }
+#pragma unroll
+  for (int j = 0; j < 20; j++) s += v[j] * v[j];
   float rs = rsqrtf(block_sum<256>(s, red) / H + 1e-6f);
-  for (int j = 0; j < 20; j++) {
-    int i = threadIdx.x + 256 * j;
-    if (i < H) out[i] = __float2bfloat16(v[j] * rs * (1.f + bf(w[i])));
-  }
+#pragma unroll
+  for (int j = 0; j < 20; j++) v[j] = v[j] * rs * (1.f + wv[j]);
+  store_row5120(out, v);
 }
 
 // Acceptance of one speculative round and the position bookkeeping (one block of 64 threads).

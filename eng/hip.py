@@ -69,7 +69,7 @@ lib.gate_mul.argtypes = [I, P, P, P]
 
 def add_rmsnorm(x, d, w, out):
     """x (R, H) bf16 (rows may be strided); x += d (if d is not None, contiguous); out = rmsnorm(x) * (1 + w)."""
-    assert x.stride(1) == 1 and out.stride(1) == 1 and (d is None or d.is_contiguous())
+    assert x.stride(1) == 1 and out.stride(1) == 1 and (d is None or d.is_contiguous()) and x.shape[1] == 5120
     _check(lib.add_rmsnorm(x.shape[0], x.shape[1], p(x), P(0) if d is None else p(d), p(w), p(out), x.stride(0),
                            out.stride(0), stream()), "add_rmsnorm")
 
@@ -168,7 +168,7 @@ lib.mtp_in.argtypes = [I, I, P, P, P, I, P, P, P, P]
 def mtp_in(tok, embed, hid, we, wh, mx):
     """mx (R, 2H) = [rmsnorm(embed[tok]) * (1 + we) | rmsnorm(hid) * (1 + wh)]; tok (R,) int64, hid rows strided."""
     R, Hd = hid.shape
-    assert tok.dtype == torch.int64 and hid.stride(1) == 1 and mx.is_contiguous()
+    assert tok.dtype == torch.int64 and hid.stride(1) == 1 and mx.is_contiguous() and Hd == 5120
     _check(lib.mtp_in(R, Hd, p(tok), p(embed), p(hid), hid.stride(0), p(we), p(wh), p(mx), stream()), "mtp_in")
 
 
