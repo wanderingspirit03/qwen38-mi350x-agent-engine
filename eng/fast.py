@@ -89,8 +89,8 @@ class A8Linear:
     acc = {}        # residual tensor's data_ptr -> fp32 (16, K)
     pending = {}    # data_ptr -> rows with sums not yet added
 
-    def __init__(self, w, norm=None, swiglu=False):
-        self.p = w4a8.quantize(w, norm_weight=norm, swiglu=swiglu)
+    def __init__(self, w, norm=None, swiglu=False, H=None):
+        self.p = w4a8.quantize(w, norm_weight=norm, swiglu=swiglu, H=H)
 
     @staticmethod
     def _xa(x):
@@ -154,19 +154,22 @@ def attn_decode_ref(q, kc, vc, pos_dev, R):
 
 
 class Fast:
-    def __init__(self, w, K, dev="cuda", hess=None):
-        """hess: eng.gptq.mtp_hessians(...) for GPTQ of the MTP layer and the draft head (None: round-to-nearest)"""
+    def __init__(self, w, K, dev="cuda", hess=None, thess=None):
+        """hess: eng.gptq.mtp_hessians(...) for GPTQ of the MTP layer and the draft head; thess:
+        eng.gptq.TargetHessians for GPTQ of the target's W4A8 weights (None: round-to-nearest)"""
         self.w, self.K, self.R = w, K, K + 1
         R = self.R
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.lin = []
         for i, L in enumerate(w.layers):
-            self.lin.append(self._layer_lin(L, IS_ATTN[i], A8Linear if W4A8 != "0" else Linear))
+            TL = A8Linear if W4A8 != "0" else Linear
+            th = thess.layer(i) if thess is not None and TL is A8Linear else None
+            self.lin.append(self._layer_lin(L, IS_ATTN[i], TL, H=th))
         M = w.mtp
         ML = A8Linear if W4A8 == "mtp" else Linear
-        hk = {"H": hess} if hess is not None and ML is Linear else {}
-        self.mlin = self._layer_lin(M, True, ML, **hk)
-        self.mlin["fc"] = ML(M["fc"], H=hess["fc"]) if hk else ML(M["fc"])
+        mh = hess if hess is not None and ML is Linear else {}
+        self.mlin = self._layer_lin(M, True, ML, H=mh)
+        self.mlin["fc"] = ML(M["fc"], H=mh.get("fc"))
         HL = {4: Linear, 8: W8Linear, 16: Bf16Linear}[HEAD_BITS]
         self.head = HL(w.lm_head)
         # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head,
@@ -248,15 +251,13 @@ class Fast:
     # ---- the target model on R rows ----
     @staticmethod
     def _layer_lin(L, attn, Lin=Linear, H=None):
-        if H is not None:       # GPTQ (the MTP layer)
-            return {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True, H=H["gate_up"]),
-                    "down": Lin(L["down"], H=H["down"]), "qkv": Lin(L["qkv"], L["in_norm"], H=H["qkv"]),
-                    "o": Lin(L["o"], H=H["o"])}
-        d = {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True), "down": Lin(L["down"])}
+        H = H or {}             # X^T X per GEMM for GPTQ
+        d = {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True, H=H.get("gate_up")),
+             "down": Lin(L["down"], H=H.get("down"))}
         if attn:
-            d["qkv"], d["o"] = Lin(L["qkv"], L["in_norm"]), Lin(L["o"])
+            d["qkv"], d["o"] = Lin(L["qkv"], L["in_norm"], H=H.get("qkv")), Lin(L["o"], H=H.get("o"))
         else:
-            d["in_proj"], d["out"] = Lin(L["in_proj"], L["in_norm"]), Lin(L["out"])
+            d["in_proj"], d["out"] = Lin(L["in_proj"], L["in_norm"], H=H.get("in_proj")), Lin(L["out"], H=H.get("out"))
         return d
 
     def mlp(self, lin, rows):

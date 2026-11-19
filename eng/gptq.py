@@ -60,8 +60,6 @@ def _rms(x, w=None):
 def mtp_hessians(w, pre, st):
     """X^T X per MTP linear ('fc', 'qkv', 'o', 'gate_up', 'down'; inputs of qkv / gate_up are x / rms(x), the
     norm weight being folded into W) and of the draft head ('head'), over the calibration tokens."""
-    ids = torch.from_numpy(np.load(os.path.join(os.path.dirname(__file__), "calib_ids.npy")).astype(np.int64))
-    ids = ids.cuda()
     M = w.mtp
     Wf = {k: M[k].float() for k in ("fc", "qkv", "o", "gate_up", "down")}
     Hs = {}
@@ -69,8 +67,7 @@ def mtp_hessians(w, pre, st):
     def acc(name, X):
         Hs[name] = Hs.get(name, 0) + X.t() @ X
 
-    for seq in torch.tensor_split(ids, torch.nonzero(ids == -1).flatten().cpu()):
-        seq = seq[seq >= 0]
+    for seq in _calib_ids():
         L = seq.shape[0]
         st.ssm.zero_()
         st.conv.zero_()
@@ -118,3 +115,68 @@ def mtp_hessians(w, pre, st):
     st.ssm.zero_()
     st.conv.zero_()
     return Hs
+
+
+class _Hook:
+    """Stands in for a bf16 prefill Lin and adds X^T X of its input to H[name]."""
+
+    def __init__(self, lin, H, name):
+        self.lin, self.H, self.name, self.fp8 = lin, H, name, False
+
+    def __call__(self, x, out):
+        X = x.float()
+        self.H[self.name] = self.H.get(self.name, 0) + X.t() @ X
+        self.lin(x, out)
+
+    def norm_in(self, x, d, w, h, out):
+        from . import hip as Hk
+        Hk.add_rmsnorm(x, d, w, h)
+        self(h, out)
+
+
+class TargetHessians:
+    """X^T X of the input of every target-model GEMM as the W4A8 GEMMs see it (normed input including the norm
+    weight; gated attention / GDN output; SwiGLU output), from the bf16 prefill path over the calibration tokens.
+    GROUP layers per calibration pass, computed when layer() first asks for one of them (bounded memory)."""
+    GROUP = 16
+
+    def __init__(self, w, st):
+        from .prefill import Prefill
+        self.w, self.st = w, st
+        self.pre = Prefill(w, fp8=False)
+        self.ids = _calib_ids()
+        self.g, self.cur = -1, {}
+
+    def layer(self, i):
+        g = i // self.GROUP
+        if g != self.g:
+            self.g, self.cur = g, {}
+            torch.cuda.empty_cache()
+            self._pass(range(g * self.GROUP, min(len(self.w.layers), (g + 1) * self.GROUP)))
+        return self.cur.pop(i)
+
+    @torch.inference_mode()
+    def _pass(self, layers):
+        from . import prefill as PF
+        saved = {li: dict(self.pre.lin[li]) for li in layers}
+        for li in layers:
+            self.cur[li] = {}
+            for k, lin in saved[li].items():
+                self.pre.lin[li][k] = _Hook(lin, self.cur[li], k)
+        attn2, PF.ATTN2 = PF.ATTN2, False
+        st = self.st
+        for seq in self.ids:
+            st.ssm.zero_()
+            st.conv.zero_()
+            for s0 in range(0, seq.shape[0], PF.CHUNK):
+                self.pre.chunk(seq[s0:s0 + PF.CHUNK], s0, st)
+        PF.ATTN2 = attn2
+        st.ssm.zero_()
+        st.conv.zero_()
+        for li in layers:
+            self.pre.lin[li].update(saved[li])
+
+
+def _calib_ids():
+    ids = torch.from_numpy(np.load(os.path.join(os.path.dirname(__file__), "calib_ids.npy")).astype(np.int64))
+    return [s[s >= 0].cuda() for s in torch.tensor_split(ids, torch.nonzero(ids == -1).flatten())]

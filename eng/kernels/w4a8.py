@@ -70,8 +70,11 @@ def _pack(u, s, z):
 
 
 @torch.no_grad()
-def quantize(w, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192):
+def quantize(w, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192, H=None):
+    """H: X^T X of the GEMM's input (x * (1 + norm_weight) / rms(x) if normed): GPTQ (eng.gptq), all rows at once"""
     N, K = w.shape
+    if H is not None:
+        rows_per_chunk = N
     assert N % 16 == 0 and K % 128 == 0
     if swiglu:
         assert N % 32 == 0
@@ -79,7 +82,11 @@ def quantize(w, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk
     qs, ss, zs = [], [], []
     for r0 in range(0, N, rows_per_chunk):
         wc = w[r0:r0 + rows_per_chunk].float()
-        u, s, z = w4.rtn_search(wc.reshape(-1, K // 128, 128), clip_search)
+        if H is None:
+            u, s, z = w4.rtn_search(wc.reshape(-1, K // 128, 128), clip_search)
+        else:
+            from ..gptq import gptq_codes
+            u, s, z = gptq_codes(wc, H)
         q, sc, zp = _pack(u, s, z)
         qs.append(q)
         ss.append(sc)

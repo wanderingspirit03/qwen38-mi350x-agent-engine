@@ -7,7 +7,7 @@ import torch
 
 from .cache import PrefixCache
 from .fast import Fast, SeqState
-from .gptq import mtp_hessians
+from .gptq import TargetHessians, mtp_hessians
 from .model import Weights
 from .prefill import CHUNK, Prefill
 
@@ -25,7 +25,9 @@ class Engine:
         self.st.k, self.st.v = self.kv[0], self.kv[1]
         self.pre = Prefill(self.w, fp8=os.environ.get("ENG_FP8", "1") == "1")
         hess = mtp_hessians(self.w, self.pre, self.st) if os.environ.get("ENG_GPTQ", "1") == "1" else None
-        self.fast = Fast(self.w, SPEC_K, hess=hess)
+        thess = TargetHessians(self.w, self.st) if os.environ.get("ENG_GPTQ_TARGET", "1") == "1" else None
+        self.fast = Fast(self.w, SPEC_K, hess=hess, thess=thess)
+        del thess
         self.graphs = os.environ.get("ENG_GRAPHS", "1") == "1"
         if self.graphs:
             self.fast.capture(self.st)
