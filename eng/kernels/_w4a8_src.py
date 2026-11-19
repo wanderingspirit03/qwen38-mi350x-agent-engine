@@ -143,7 +143,32 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
         f.g = __builtin_bit_cast(float2, __builtin_amdgcn_raw_buffer_load_b64(gr, (m * NG + kb) * 8, 0, 0));
 #endif
     };
-    // the first DEPTH k blocks are requested before anything else
+    // the scales of the NT tiles (groups [g0, g1), global layout [t][NG][2 x 16 bytes] kept in LDS) and the
+    // zero-point operands of this wave's first chunk of 32 groups are requested first, then the first DEPTH k blocks
+    extern __shared__ u32x4 lsc[];
+    const int slen = (g1 - g0) * 2, n16 = NT * slen;
+    const u32x4* ssrc = msc + (size_t)tile0 * NG * 2;
+    auto sidx = [&](int i) { const int t = i / slen; return t * NG * 2 + g0 * 2 + i - t * slen; };
+    constexpr int SCB = 4;
+    u32x4 sv[SCB];
+#ifndef X_NOPRO
+#pragma unroll
+    for (int u = 0; u < SCB; u++) {
+        const int i = threadIdx.x + u * WAVES * 64;
+        if (i < n16) sv[u] = ssrc[sidx(i)];
+    }
+#endif
+    const bool zt = sk == 0;     // the zero-point term is added by split 0
+    const int c0 = wave;
+    bf16x8 zb, za[NT];
+#ifndef X_NOPRO
+    if (zt && c0 * 32 < NG) {
+        zb = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(zr, (m * NGp + c0 * 32 + lg * 8) * 2, 0, 0));
+#pragma unroll
+        for (int t = 0; t < NT; t++)
+            za[t] = __builtin_bit_cast(bf16x8, mzp[((size_t)(tile0 + t) * 16 + m) * (NGp / 8) + c0 * 4 + lg]);
+    }
+#endif
     Frag<NT> f0, f1, f2, f3;
     load(f0, kbeg);
     load(f1, kbeg + KS);
@@ -151,32 +176,17 @@ void w4a8_kernel(const int8_t* xq, const float2* xg, const __bf16* xzp, const u3
     if (DEPTH > 3) load(f3, kbeg + 3 * KS);
     BAR
 
-    // scales of the NT tiles -> LDS (NT * NG * 32 bytes, contiguous in global memory)
-    extern __shared__ u32x4 lsc[];
     f32x4 acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = f32x4{0.f, 0.f, 0.f, 0.f};
     float ss = 0.f;
 #ifndef X_NOPRO   // experiment: no scale copy and no zero-point term
-    // zero-point operands of this wave's first chunk of 32 groups, requested now and used after the scale copy
-    const bool zt = sk == 0;     // the zero-point term is added by split 0
-    const int c0 = wave;
-    bf16x8 zb, za[NT];
-    if (zt && c0 * 32 < NG) {
-        zb = __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(zr, (m * NGp + c0 * 32 + lg * 8) * 2, 0, 0));
 #pragma unroll
-        for (int t = 0; t < NT; t++)
-            za[t] = __builtin_bit_cast(bf16x8, mzp[((size_t)(tile0 + t) * 16 + m) * (NGp / 8) + c0 * 4 + lg]);
+    for (int u = 0; u < SCB; u++) {
+        const int i = threadIdx.x + u * WAVES * 64;
+        if (i < n16) lsc[sidx(i)] = sv[u];
     }
-    {
-        // scales of groups [g0, g1) of the NT tiles; LDS keeps the global layout [t][NG][2 x 16 bytes]
-        const int len = (g1 - g0) * 2, n16 = NT * len;
-        const u32x4* src = msc + (size_t)tile0 * NG * 2;
-        for (int i = threadIdx.x; i < n16; i += WAVES * 64) {
-            const int t = i / len, j = t * NG * 2 + g0 * 2 + i - t * len;
-            lsc[j] = src[j];
-        }
-    }
+    for (int i = threadIdx.x + SCB * WAVES * 64; i < n16; i += WAVES * 64) lsc[sidx(i)] = ssrc[sidx(i)];
     if (zt && c0 * 32 < NG) {
 #pragma unroll
         for (int t = 0; t < NT; t++) acc[t] = MFMA_BF(za[t], zb, acc[t], 0, 0, 0);

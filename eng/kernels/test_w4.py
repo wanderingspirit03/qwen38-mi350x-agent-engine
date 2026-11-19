@@ -29,6 +29,7 @@ SHAPES = {  # name: (N, K, tensors concatenated along N, norm weight)
     "lm_head": (248320, 5120, ["lm_head.weight"], "model.language_model.norm.weight"),
     "mtp_fc": (5120, 10240, None, None),         # benchmark only (random weights)
     "dhead": (32768, 5120, None, None),
+    "dhead_x": (33024, 5120, None, None),       # draft head with the 256 prompt-token slots (ENG_DRAFT_EXTRA)
 }
 MS = (1, 2, 4, 8, 16)
 
