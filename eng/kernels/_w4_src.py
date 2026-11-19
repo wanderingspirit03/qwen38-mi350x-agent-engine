@@ -57,14 +57,25 @@ struct Pend {          // MFMA results of one k block whose scale/zero epilogue 
     uint32_t z[NT][GPB];
 };
 
-enum { F_SWIGLU = 1, F_XDUP = 2 };   // F_XDUP: x has K/2 columns, k block kb reads x block kb/2
+enum { F_SWIGLU = 1, F_XDUP = 2, F_ARGMAX = 4 };   // F_XDUP: x has K/2 columns, k block kb reads x block kb/2
+
+// F_ARGMAX (M = 1, one k split): each workgroup also does an atomic max of its best key (bf16 value, -n) into one of
+// AM_S = 16 u64 slots am[]; a later kernel takes the argmax from the slots and zeroes them (small.hip: am_decode).
+// No returning atomics: waiting for one in the epilogue delays every workgroup (+12 us on the draft head).
+#define AM_S 16
+__device__ __forceinline__ unsigned long long am_key(float v, int j) {
+    unsigned int b = __float_as_uint(v);
+    b = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    return ((unsigned long long)b << 32) | (unsigned int)(0x7fffffff - j);
+}
 
 // After the k loop: split-k reduction (the last of the ksplit workgroups of a unit adds the partials up),
 // 1/rms scaling, then SwiGLU or the (optional) residual add, and the bf16 store. unit: index of the
 // independent group of NT row tiles (counter and sum(x^2) slot). acc[NT] holds x.x^T if RMS.
 template <int NT, bool RMS>
 __device__ __forceinline__ void finish(f32x4* acc, int unit, int tile0, int lane, __bf16* y, const __bf16* res,
-                                       float* ws, int* cnt, int M, int N, int K, int flags, float eps) {
+                                       float* ws, int* cnt, int M, int N, int K, int flags, float eps,
+                                       unsigned long long* am) {
     const int lg = lane >> 4, m = lane & 15;
     const bool mok = m < M;
     const int ksplit = gridDim.y;
@@ -125,6 +136,7 @@ __device__ __forceinline__ void finish(f32x4* acc, int unit, int tile0, int lane
         }
         return;
     }
+    unsigned long long best = 0;
 #pragma unroll
     for (int t = 0; t < NT; t++) {
 #pragma unroll
@@ -133,8 +145,21 @@ __device__ __forceinline__ void finish(f32x4* acc, int unit, int tile0, int lane
             const size_t o = (size_t)m * N + n;
             float v = acc[t][j];
             if (res) v += (float)res[o];
-            y[o] = (__bf16)v;
+            const __bf16 b = (__bf16)v;
+            y[o] = b;
+            if (flags & F_ARGMAX) {
+                const unsigned long long k = am_key((float)b, n);
+                best = k > best ? k : best;
+            }
         }
+    }
+    if (flags & F_ARGMAX) {     // lanes 0, 16, 32, 48 (row 0) are the active ones
+#pragma unroll
+        for (int o = 16; o < 64; o <<= 1) {
+            const unsigned long long k = (unsigned long long)__shfl_xor((long long)best, o);
+            best = k > best ? k : best;
+        }
+        if (lane == 0) __hip_atomic_fetch_max(am + blockIdx.x % AM_S, best, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
 }
 
@@ -147,7 +172,8 @@ template <int NT, int G, int WAVES, bool NTL, bool RMS>
 __global__ __launch_bounds__(WAVES * 64)
 void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
                     __bf16* y, const __bf16* res, float* __restrict__ ws, int* __restrict__ cnt,
-                    int M, int N, int K, uint32_t mask, uint32_t magic, int flags, float eps) {
+                    int M, int N, int K, uint32_t mask, uint32_t magic, int flags, float eps,
+                    unsigned long long* am) {
     constexpr int GPB = 128 / G;          // groups per 128-k block
     constexpr int SPG = G / 32;           // k-steps (of 32) per group
     constexpr int NA = NT + (RMS ? 1 : 0);
@@ -292,7 +318,7 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
         for (int t = 0; t < NA; t++)
             for (int w = 0; w < WAVES - 1; w++) acc[t] += red[w][t][lane];
     }
-    finish<NT, RMS>(acc, blockIdx.x, tile0, lane, y, res, ws, cnt, M, N, K, flags, eps);
+    finish<NT, RMS>(acc, blockIdx.x, tile0, lane, y, res, ws, cnt, M, N, K, flags, eps, am);
 }
 
 #define INST(NT, G, W, RMS) \
@@ -300,7 +326,8 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
         hipLaunchKernelGGL((w4_gemm_kernel<NT, G, W, true, RMS>), dim3(N / 16 / NT, ksplit), dim3(W * 64), \
             NT * ((K / 128 + ksplit - 1) / ksplit) * (128 / G) * 48, stream, \
             (const __bf16*)x, (const u32x4*)qw, (const u32x4*)meta, (__bf16*)y, \
-            (const __bf16*)res, ws, cnt, M, N, K, 0x000F000Fu, 0x43004300u, flags, eps); \
+            (const __bf16*)res, ws, cnt, M, N, K, 0x000F000Fu, 0x43004300u, flags, eps, \
+            (unsigned long long*)am); \
         return 0; }
 
 #define INST_W(NT, G, RMS) INST(NT, G, 1, RMS) INST(NT, G, 2, RMS) INST(NT, G, 4, RMS) INST(NT, G, 8, RMS)
@@ -309,7 +336,7 @@ void w4_gemm_kernel(const __bf16* x, const u32x4* qw, const u32x4* meta,
 
 extern "C" int w4_gemm(const void* x, const void* qw, const void* meta, void* y, const void* res,
                        float* ws, int* cnt, int M, int N, int K, int g, int nt, int waves, int ksplit,
-                       int rms, int flags, float eps, hipStream_t stream) {
+                       int rms, int flags, float eps, void* am, hipStream_t stream) {
     INST_G(128, 0) INST_G(64, 0) INST_G(128, 1) INST_G(64, 1)
     return -1;
 }

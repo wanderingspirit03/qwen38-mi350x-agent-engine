@@ -51,7 +51,7 @@ def _build(prefix=None):
         os.replace(tmp, so)
     lib = ctypes.CDLL(so)
     lib.w4_gemm.restype = ctypes.c_int
-    lib.w4_gemm.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 9 + [ctypes.c_float, ctypes.c_void_p])
+    lib.w4_gemm.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 9 + [ctypes.c_float] + [ctypes.c_void_p] * 2)
     if prefix is None:
         _lib = lib
     return lib
@@ -197,9 +197,12 @@ _ws = {}
 def _workspace(device):
     """Split-k partial sums (fp32) and per-row-tile arrival counters (reset by the kernel after use)."""
     device = torch.device(device)
+    if device.index is None:
+        device = torch.device(device.type, torch.cuda.current_device())
     if device not in _ws:
         _ws[device] = (torch.empty(WS_FLOATS, dtype=torch.float32, device=device),
-                       torch.zeros(65536, dtype=torch.int32, device=device))
+                       torch.zeros(65536, dtype=torch.int32, device=device),
+                       torch.zeros(16, dtype=torch.int64, device=device))     # argmax slots (see F_ARGMAX)
     return _ws[device]
 
 
@@ -230,8 +233,14 @@ def config_for(N, K, M):
             return c
 
 
-def gemm(x, p, out=None, residual=None, cfg=None):
-    """x: (M, K) bf16 contiguous, M <= 16. Returns (M, N) bf16 = x @ W^T (+ residual). See module docstring."""
+def argmax_slots(device):
+    """The slots gemm(argmax=True) leaves its argmax in; eng.hip.am_decode / mtp_in read and zero them."""
+    return _workspace(device)[2]
+
+
+def gemm(x, p, out=None, residual=None, cfg=None, argmax=False):
+    """x: (M, K) bf16 contiguous, M <= 16. Returns (M, N) bf16 = x @ W^T (+ residual). See module docstring.
+    argmax: also leave the argmax of the bf16 output row in argmax_slots() (M = 1)."""
     lib = _build()
     M = x.shape[0]
     N, K = p["N"], p["K"]
@@ -244,12 +253,14 @@ def gemm(x, p, out=None, residual=None, cfg=None):
     nt, waves, ksplit = cfg or config_for(N, K, M)
     assert not (p["swiglu"] and nt % 2), "swiglu needs an even number of row tiles per wave"
     assert N % (16 * nt) == 0 and N // (16 * nt) <= 65536 and waves in (1, 2, 4, 8, 16)
-    ws, cnt = _workspace(x.device)
+    ws, cnt, am = _workspace(x.device)
+    assert not argmax or (M == 1 and ksplit == 1 and not p["swiglu"] and residual is None)
     assert ksplit == 1 or ksplit * (M * N + N // nt * 16) <= WS_FLOATS
     assert lds_bytes(nt, ksplit, K, p["G"]) <= 65536, "scales do not fit in LDS"
     rc = lib.w4_gemm(x.data_ptr(), p["qw"].data_ptr(), p["meta"].data_ptr(),
                      out.data_ptr(), residual.data_ptr() if residual is not None else None,
                      ws.data_ptr(), cnt.data_ptr(), M, N, K, p["G"], nt, waves, ksplit,
-                     int(p["rms"]), int(p["swiglu"]) | (2 if xdup else 0), EPS, torch.cuda.current_stream().cuda_stream)
+                     int(p["rms"]), int(p["swiglu"]) | (2 if xdup else 0) | (4 if argmax else 0), EPS, am.data_ptr(),
+                     torch.cuda.current_stream().cuda_stream)
     assert rc == 0, "no kernel instance for this configuration"
     return out

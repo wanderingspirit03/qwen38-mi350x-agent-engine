@@ -323,12 +323,44 @@ __global__ __launch_bounds__(256) void argmax_kernel(const bf16* __restrict__ x,
 
 // MTP input: mx[r, :H] = rmsnorm(embed[tok[r]]) * (1 + we); mx[r, H:] = rmsnorm(hid[r]) * (1 + wh).
 // grid (R, 2), block 256, H = 5120.
-__global__ __launch_bounds__(256) void mtp_in_kernel(const long long* __restrict__ tok, const bf16* __restrict__ embed,
+// The argmax a w4 GEMM left in 16 slots (key: bf16 value, 0x7fffffff - index; w4 F_ARGMAX), through map; zeroes
+// the slots. Returns -1 if they are empty. Wave 0 of the block. Agent-scope loads and stores: plain ones can see a
+// stale copy in this XCD's L2.
+__device__ long long am_take(unsigned long long* am, const long long* map) {
+  const int l = threadIdx.x;
+  unsigned long long k = l < 16 ? __hip_atomic_load(am + l, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : 0ull;
+  for (int o = 8; o > 0; o >>= 1) {
+    const unsigned long long t = (unsigned long long)__shfl_xor((long long)k, o);
+    k = t > k ? t : k;
+  }
+  k = (unsigned long long)__shfl((long long)k, 0);
+  if (k == 0) return -1;
+  if (l < 16) __hip_atomic_store(am + l, 0ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  const int idx = 0x7fffffff - (int)(k & 0xffffffffu);
+  return map ? map[idx] : idx;
+}
+
+// MTP input: mx[r, :H] = rmsnorm(embed[tok[r]]) * (1 + we); mx[r, H:] = rmsnorm(hid[r]) * (1 + wh).
+// grid (R, 2), block 256, H = 5120. am (R = 1, optional): if the argmax slots are set, tok[0] = map[their argmax]
+// (written back) and the slots are zeroed.
+__global__ __launch_bounds__(256) void mtp_in_kernel(long long* __restrict__ tok, const bf16* __restrict__ embed,
                                                      const bf16* __restrict__ hid, int hs, const bf16* __restrict__ we,
-                                                     const bf16* __restrict__ wh, bf16* __restrict__ mx, int H) {
+                                                     const bf16* __restrict__ wh, bf16* __restrict__ mx, int H,
+                                                     unsigned long long* am, const long long* map) {
   __shared__ float red[4];
+  __shared__ long long tk;
   int r = blockIdx.x, part = blockIdx.y;
-  const bf16* x = part == 0 ? embed + (size_t)tok[r] * H : hid + (size_t)r * hs;
+  if (am && part == 0) {
+    if (threadIdx.x < 64) {
+      const long long t = am_take(am, map);
+      if (threadIdx.x == 0) {
+        tk = t < 0 ? tok[0] : t;
+        if (t >= 0) tok[0] = t;
+      }
+    }
+    __syncthreads();
+  }
+  const bf16* x = part == 0 ? embed + (size_t)(am ? tk : tok[r]) * H : hid + (size_t)r * hs;
   const bf16* w = part == 0 ? we : wh;
   bf16* out = mx + (size_t)r * 2 * H + part * H;
   float v[20], wv[20];
@@ -385,10 +417,20 @@ int accept(int R, void* vt, const void* y, void* n_acc, void* nw, void* res, voi
                      (long long*)nw, (long long*)res, (long long*)pick, (int*)pos, (int*)P);
   return (int)hipGetLastError();
 }
-int mtp_in(int R, int H, const void* tok, const void* embed, const void* hid, int hs, const void* we, const void* wh,
-           void* mx, hipStream_t s) {
-  hipLaunchKernelGGL(mtp_in_kernel, dim3(R, 2), dim3(256), 0, s, (const long long*)tok, (const bf16*)embed,
-                     (const bf16*)hid, hs, (const bf16*)we, (const bf16*)wh, (bf16*)mx, H);
+int mtp_in(int R, int H, void* tok, const void* embed, const void* hid, int hs, const void* we, const void* wh,
+           void* mx, void* am, const void* map, hipStream_t s) {
+  hipLaunchKernelGGL(mtp_in_kernel, dim3(R, 2), dim3(256), 0, s, (long long*)tok, (const bf16*)embed,
+                     (const bf16*)hid, hs, (const bf16*)we, (const bf16*)wh, (bf16*)mx, H, (unsigned long long*)am,
+                     (const long long*)map);
+  return (int)hipGetLastError();
+}
+__global__ __launch_bounds__(64) void am_decode_kernel(unsigned long long* am, const long long* map, long long* out) {
+  const long long t = am_take(am, map);
+  if (threadIdx.x == 0 && t >= 0) out[0] = t;
+}
+int am_decode(void* am, const void* map, void* out, hipStream_t s) {
+  hipLaunchKernelGGL(am_decode_kernel, dim3(1), dim3(64), 0, s, (unsigned long long*)am, (const long long*)map,
+                     (long long*)out);
   return (int)hipGetLastError();
 }
 int argmax_rows(int R, int V, int nb, const void* x, const void* map, void* out, void* ws, void* cnt, hipStream_t s) {

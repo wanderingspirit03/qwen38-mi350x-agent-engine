@@ -4,6 +4,7 @@ python3 -m eng.kernels.test_w4 MODE   with MODE one of:
   check    quantization error and kernel error on real weights of all shapes
   tune     time every configuration per shape and M (inside HIP graphs, weights not in cache)
   bench    time the configured (default) path per shape and M
+  argmax   the GEMM with the fused argmax (M = 1, draft head shape)
 """
 import json
 import os
@@ -220,6 +221,37 @@ def variants(pre, names, Ms):
     w4._lib = None
 
 
+def argmax_fused(N=32768, K=5120, ncopy=8):
+    """GEMM with the argmax epilogue (M = 1) + am_decode against torch argmax of the same output and the separate
+    argmax kernel; then timing (weights cycled, not in cache)."""
+    from .. import hip as H
+    ps = [make_packed(N, K, 128) for _ in range(ncopy)]
+    mp = torch.randperm(N, device="cuda").long()
+    am = w4.argmax_slots("cuda")
+    x = torch.randn(1, K, device="cuda").bfloat16()
+    y = torch.empty(1, N, dtype=torch.bfloat16, device="cuda")
+    o1, o2 = torch.zeros(1, dtype=torch.long, device="cuda"), torch.zeros(1, dtype=torch.long, device="cuda")
+    bad = 0
+    for i in range(200):
+        x.normal_()
+        if i % 3 == 0:
+            x[0, :] = 0.          # all-equal row: ties
+        p = ps[i % ncopy]
+        w4.gemm(x, p, out=y, argmax=True)
+        H.am_decode(am, o1, mp if i % 2 else None)
+        ref = int(y.float().argmax())
+        H.argmax_rows(y, o2, mp if i % 2 else None)
+        want = int(mp[ref]) if i % 2 else ref
+        bad += int(o1) != want or int(o2) != want or int(am.abs().sum()) != 0
+    print(f"argmax fused N={N} K={K}: {bad} mismatches in 200", flush=True)
+    for _ in range(3):
+        t0 = graph_time([lambda p=p: (w4.gemm(x, p, out=y), H.argmax_rows(y, o2, mp)) for p in ps]) * 1e6
+        t1 = graph_time([lambda p=p: (w4.gemm(x, p, out=y, argmax=True), H.am_decode(am, o1, mp)) for p in ps]) * 1e6
+        t2 = graph_time([lambda p=p: w4.gemm(x, p, out=y, argmax=True) for p in ps]) * 1e6
+        t3 = graph_time([lambda p=p: w4.gemm(x, p, out=y) for p in ps]) * 1e6
+        print(f"  gemm+argmax {t0:.1f} us, fused+decode {t1:.1f} us, fused {t2:.1f} us, gemm alone {t3:.1f} us",
+              flush=True)
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "allcfg"
     names = sys.argv[2].split(",") if len(sys.argv) > 2 and sys.argv[2] != "all" else list(SHAPES)
@@ -240,6 +272,8 @@ def main():
         tune(names, Ms)
     if mode == "variants":
         variants(pre, names, Ms)
+    if mode == "argmax":
+        argmax_fused()
     if mode == "bench":
         bench(names, Ms=Ms)
         bench(names, fused=True, Ms=Ms)
