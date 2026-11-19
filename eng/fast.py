@@ -72,12 +72,12 @@ class Linear:
                  "rms": False, "swiglu": False}
         return lin
 
-    def __call__(self, x, out, add=False):
+    def __call__(self, x, out, add=False, argmax=False):
         if self.norm is not None:
             xn = _XN[:x.shape[0]]
             H.add_rmsnorm(x, None, self.norm, xn)
             x = xn
-        w4q.gemm(x, self.p, out=out, residual=out if add else None)
+        w4q.gemm(x, self.p, out=out, residual=out if add else None, argmax=argmax)
 
 
 class A8Linear:
@@ -219,6 +219,7 @@ class Fast:
         self.mx = torch.empty(R, 2 * HIDDEN, **bf)
         self.mh = torch.empty(R, HIDDEN, **bf)
         self.mlogit = torch.empty(1, len(dv), **bf)
+        self.am = w4q.argmax_slots(dev)
         self.mhn = torch.empty(R, HIDDEN, **bf)
         # round state on the device
         i32 = dict(dtype=torch.int32, device=dev)
@@ -321,12 +322,14 @@ class Fast:
         H.gdn_commit(self.n_acc, self.qk, self.vv, self.gb, st.ssm, self.proj, st.conv)
 
     # ---- MTP ----
-    def mtp(self, st, tokens, hidden, pos, nkv, rows, pick, out):
+    def mtp(self, st, tokens, hidden, pos, nkv, rows, pick, out, decode=True):
         """The MTP layer on `rows` rows at positions pos.. (row i: target-side hidden at pos+i and the token at
         pos+i+1). Writes the draft (argmax of row `pick`) to out (1,) and leaves that row's normed hidden
-        in self.mhn[:1]."""
+        in self.mhn[:1]. decode=False: the draft stays in the argmax slots self.am until the next 1-row mtp()
+        with tokens = out takes it (saves a kernel)."""
         w, M, R = self.w, self.w.mtp, rows
-        H.mtp_in(tokens, w.embed, hidden, M["pre_emb"], M["pre_hid"], self.mx[:R])
+        H.mtp_in(tokens, w.embed, hidden, M["pre_emb"], M["pre_hid"], self.mx[:R],
+                 am=self.am if R == 1 else None, map=self.dvocab)
         self.mlin["fc"](self.mx[:R], self.x[:R])
         self.attn(self.mlin, M, 16, st, pos, nkv, R)
         self.mlp(self.mlin, R)
@@ -336,20 +339,22 @@ class Fast:
         else:
             H.add_rmsnorm(self.x[:R], None, M["norm"], self.mh[:R])
             self.mhn[:1].copy_(self.mh[:R].index_select(0, pick))
-        self.dhead(self.mhn[:1], self.mlogit)
-        H.argmax_rows(self.mlogit, out, self.dvocab)
+        self.dhead(self.mhn[:1], self.mlogit, argmax=True)
+        if decode:
+            H.am_decode(self.am, out, self.dvocab)
 
     def draft_chain(self, st):
         """vt[1] holds d_1: fill vt[2:] with K - 1 chained MTP drafts (position of x is self.pos)."""
         for j in range(1, self.K):
             P = self.P[3 + 2 * (j - 1):]
-            self.mtp(st, self.vt[j:j + 1], self.mhn[:1], P[0:1], P[1:2], 1, self.zero, self.vt[j + 1:j + 2])
+            self.mtp(st, self.vt[j:j + 1], self.mhn[:1], P[0:1], P[1:2], 1, self.zero, self.vt[j + 1:j + 2],
+                     decode=j == self.K - 1)
 
     def round(self, st):
         self.verify(st)
         self.accept(st)
         # catch-up: rows i = 0..K: hidden at pos+i, token new[i] at pos+i+1; row a = n_acc - 1 gives d_1
-        self.mtp(st, self.new, self.hn, self.P[0:1], self.P[1:2], self.R, self.pick, self.vt[1:2])
+        self.mtp(st, self.new, self.hn, self.P[0:1], self.P[1:2], self.R, self.pick, self.vt[1:2], decode=self.K == 1)
         self.draft_chain(st)
 
     def capture(self, st):

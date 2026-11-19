@@ -162,14 +162,25 @@ def argmax_rows(x, out, map=None, nb=None):
            "argmax_rows")
 
 
-lib.mtp_in.argtypes = [I, I, P, P, P, I, P, P, P, P]
+lib.mtp_in.argtypes = [I, I, P, P, P, I, P, P, P, P, P, P]
 
 
-def mtp_in(tok, embed, hid, we, wh, mx):
-    """mx (R, 2H) = [rmsnorm(embed[tok]) * (1 + we) | rmsnorm(hid) * (1 + wh)]; tok (R,) int64, hid rows strided."""
+def mtp_in(tok, embed, hid, we, wh, mx, am=None, map=None):
+    """mx (R, 2H) = [rmsnorm(embed[tok]) * (1 + we) | rmsnorm(hid) * (1 + wh)]; tok (R,) int64, hid rows strided.
+    am: argmax slots of a w4 GEMM (w4.argmax_slots, R = 1): if set, tok[0] = map[their argmax] first; zeroes them."""
     R, Hd = hid.shape
     assert tok.dtype == torch.int64 and hid.stride(1) == 1 and mx.is_contiguous() and Hd == 5120
-    _check(lib.mtp_in(R, Hd, p(tok), p(embed), p(hid), hid.stride(0), p(we), p(wh), p(mx), stream()), "mtp_in")
+    assert am is None or R == 1
+    _check(lib.mtp_in(R, Hd, p(tok), p(embed), p(hid), hid.stride(0), p(we), p(wh), p(mx),
+                      P(0) if am is None else p(am), P(0) if map is None else p(map), stream()), "mtp_in")
+
+
+lib.am_decode.argtypes = [P, P, P, P]
+
+
+def am_decode(am, out, map=None):
+    """out[0] = map[argmax left in the slots am by a w4 GEMM (w4.argmax_slots)]; zeroes the slots."""
+    _check(lib.am_decode(p(am), P(0) if map is None else p(map), p(out), stream()), "am_decode")
 
 
 lib.accept.argtypes = [I, P, P, P, P, P, P, P, P, P]
