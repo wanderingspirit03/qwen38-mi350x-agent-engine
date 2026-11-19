@@ -56,17 +56,20 @@ __global__ void gdn_prep_kernel(const bf16* __restrict__ proj, int pstride, cons
 }
 
 // The value column of a thread group of 4: thread part p holds S[k] for k in [32p, 32p + 32).
-#define KP 32
-#define VB 32   // value columns per block (block = VB * 4 threads = DK: the loaders below rely on it)
+#define NP 8    // threads per value column (k parts)
+#define KP 16   // k per thread (DK / NP)
+#define VB 16   // value columns per block (block = VB * NP threads = DK: the loaders below rely on it)
 static __device__ __forceinline__ float dpp_xor1(float x) {
   return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0xB1, 0xF, 0xF, true));
 }
 static __device__ __forceinline__ float dpp_xor2(float x) {
   return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x4E, 0xF, 0xF, true));
 }
-static __device__ __forceinline__ float sum4(float x) {
+// sum over the NP = 8 lanes of a value column
+static __device__ __forceinline__ float sum_np(float x) {
   x += dpp_xor1(x);
   x += dpp_xor2(x);
+  if (NP == 8) x += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x101F));   // + lane ^ 4
   return x;
 }
 
@@ -81,7 +84,7 @@ static __device__ __forceinline__ float delta_step(float* S, const float* q, con
     a0 += S[i] * k[i]; a1 += S[i + 1] * k[i + 1];
     b0 += S[i] * q[i]; b1 += S[i + 1] * q[i + 1];
   }
-  float kv = sum4(a0 + a1), sq = sum4(b0 + b1);
+  float kv = sum_np(a0 + a1), sq = sum_np(b0 + b1);
   float delta = (vv - decay * kv) * beta;
 #pragma unroll
   for (int i = 0; i < KP; i++) S[i] = S[i] * decay + k[i] * delta;
@@ -103,42 +106,45 @@ static __device__ __forceinline__ void run_steps(int n, int h, int vb, const flo
                                                  const float* __restrict__ v, const float* __restrict__ gb,
                                                  const float* __restrict__ state, float* __restrict__ o_out,
                                                  float* __restrict__ state_out) {
-  int tid = threadIdx.x, lc = tid >> 2, part = tid & 3, kh = h / 3, col = vb * VB + lc;
-  // [t][part][36]: the 4 k-parts start 144 bytes apart, on different LDS banks
-  __shared__ __attribute__((aligned(16))) float sq[16][4][36], sk[16][4][36];
+  int tid = threadIdx.x, lc = tid / NP, part = tid % NP, kh = h / 3, col = vb * VB + lc;
+  // [t][part][KP + 4]: the k-parts start (KP + 4) * 4 bytes apart, on different LDS banks
+  __shared__ __attribute__((aligned(16))) float sq[16][NP][KP + 4], sk[16][NP][KP + 4];
   __shared__ float sv[16][VB], sg[16], sb[16];
   float S[KP];
   load_state(S, state + ((size_t)h * DK + col) * DK + part * KP);
-  // issue every load before the first LDS store (one memory latency, not n)
-  float rq[16], rk[16], rv[4];
-#pragma unroll
-  for (int j = 0; j < 16; j++)
-    if (j < n) { rq[j] = qk[(j * 32 + kh) * DK + tid]; rk[j] = qk[(j * 32 + 16 + kh) * DK + tid]; }
-#pragma unroll
-  for (int j = 0; j < 4; j++) {
-    int t = j * 4 + (tid >> 5);
-    if (t < n) rv[j] = v[(t * NH + h) * DK + vb * VB + (tid & 31)];
-  }
-  float rg = 0.f, rb = 0.f;
-  if (tid < n) { rg = gb[(tid * 2) * NH + h]; rb = gb[(tid * 2 + 1) * NH + h]; }
-#pragma unroll
-  for (int j = 0; j < 16; j++)
-    if (j < n) { sq[j][tid >> 5][tid & 31] = rq[j]; sk[j][tid >> 5][tid & 31] = rk[j]; }
-#pragma unroll
-  for (int j = 0; j < 4; j++) {
-    int t = j * 4 + (tid >> 5);
-    if (t < n) sv[t][tid & 31] = rv[j];
-  }
-  if (tid < n) { sg[tid] = rg; sb[tid] = rb; }
-  __shared__ float skq[16][2];
+  // every load first and nothing under a branch, so the loads and the 16 reductions below overlap (rows >= n
+  // repeat row n - 1 and are not used)
+  constexpr int RV = 16 * VB / DK;   // v loads per thread (DK / VB rows per pass)
+  float rq[16], rk[16], rv[RV];
 #pragma unroll
   for (int j = 0; j < 16; j++) {
-    if (j < n) {
-      float x = rq[j] * rk[j];
-      for (int m = 32; m > 0; m >>= 1) x += __shfl_xor(x, m);
-      if ((tid & 63) == 0) skq[j][tid >> 6] = x;
-    }
+    const int jj = min(j, n - 1);
+    rq[j] = qk[(jj * 32 + kh) * DK + tid];
+    rk[j] = qk[(jj * 32 + 16 + kh) * DK + tid];
   }
+#pragma unroll
+  for (int j = 0; j < RV; j++) {
+    int t = min(j * (DK / VB) + tid / VB, n - 1);
+    rv[j] = v[(t * NH + h) * DK + vb * VB + tid % VB];
+  }
+  const int tg = min(tid, n - 1);
+  float rg = gb[(tg * 2) * NH + h], rb = gb[(tg * 2 + 1) * NH + h];
+#pragma unroll
+  for (int j = 0; j < 16; j++) { sq[j][tid / KP][tid % KP] = rq[j]; sk[j][tid / KP][tid % KP] = rk[j]; }
+#pragma unroll
+  for (int j = 0; j < RV; j++) sv[j * (DK / VB) + tid / VB][tid % VB] = rv[j];
+  if (tid < 16) { sg[tid] = rg; sb[tid] = rb; }
+  __shared__ float skq[16][2];
+  float x[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) x[j] = rq[j] * rk[j];
+#pragma unroll
+  for (int m = 32; m > 0; m >>= 1)
+#pragma unroll
+    for (int j = 0; j < 16; j++) x[j] += __shfl_xor(x[j], m);
+  if ((tid & 63) == 0)
+#pragma unroll
+    for (int j = 0; j < 16; j++) skq[j][tid >> 6] = x[j];
   __syncthreads();
   for (int t = 0; t < n; t++) {
     float o = delta_step(S, sq[t][part], sk[t][part], sv[t][lc], sg[t], sb[t], skq[t][0] + skq[t][1]);
@@ -151,15 +157,15 @@ static __device__ __forceinline__ void run_steps(int n, int h, int vb, const flo
   }
 }
 
-// verify: grid (48, 128 / VB), block VB * 4. state (48, 128 v, 128 k) fp32, read only. o (T, 48, 128) fp32.
-__global__ __launch_bounds__(VB * 4) void gdn_verify_kernel(int T, const float* __restrict__ qk,
+// verify: grid (48, 128 / VB), block VB * NP. state (48, 128 v, 128 k) fp32, read only. o (T, 48, 128) fp32.
+__global__ __launch_bounds__(VB * NP) void gdn_verify_kernel(int T, const float* __restrict__ qk,
                                                            const float* __restrict__ v, const float* __restrict__ gb,
                                                            const float* __restrict__ state, float* __restrict__ o) {
   run_steps(T, blockIdx.x, blockIdx.y, qk, v, gb, state, o, nullptr);
 }
 
 // commit: grid (48 * 128 / VB, L). Advances each layer's state by n = *n_dev rows (from the prep outputs).
-__global__ __launch_bounds__(VB * 4) void gdn_commit_kernel(const int* __restrict__ n_dev,
+__global__ __launch_bounds__(VB * NP) void gdn_commit_kernel(const int* __restrict__ n_dev,
                                                            const float* __restrict__ qk, const float* __restrict__ v,
                                                            const float* __restrict__ gb, float* __restrict__ state,
                                                            int Tmax) {
@@ -303,7 +309,7 @@ int gdn_prep(int T, const void* proj, int pstride, const void* hist, const void*
 }
 int gdn_verify(int T, const void* qk, const void* v, const void* gb, const void* state, void* o, const void* proj,
                int pstride, const void* gw, void* out, hipStream_t s) {
-  hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * 4), 0, s, T, (const float*)qk, (const float*)v,
+  hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * NP), 0, s, T, (const float*)qk, (const float*)v,
                      (const float*)gb, (const float*)state, (float*)o);
   hipLaunchKernelGGL(gated_norm_kernel<float>, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (bf16*)out);
@@ -311,7 +317,7 @@ int gdn_verify(int T, const void* qk, const void* v, const void* gb, const void*
 }
 int gdn_verify_q(int T, const void* qk, const void* v, const void* gb, const void* state, void* o, const void* proj,
                  int pstride, const void* gw, void* xq, void* xg, void* xzp, int ngp, hipStream_t s) {
-  hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * 4), 0, s, T, (const float*)qk, (const float*)v,
+  hipLaunchKernelGGL(gdn_verify_kernel, dim3(NH, DK / VB), dim3(VB * NP), 0, s, T, (const float*)qk, (const float*)v,
                      (const float*)gb, (const float*)state, (float*)o);
   hipLaunchKernelGGL(gated_norm_q_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (signed char*)xq, (float2*)xg, (bf16*)xzp, ngp);
@@ -319,7 +325,7 @@ int gdn_verify_q(int T, const void* qk, const void* v, const void* gb, const voi
 }
 int gdn_commit(int L, int Tmax, const void* n_dev, const void* qk, const void* v, const void* gb, void* state,
                const void* proj, int pstride, long lproj, void* hist, hipStream_t s) {
-  hipLaunchKernelGGL(gdn_commit_kernel, dim3(NH * DK / VB, L), dim3(VB * 4), 0, s, (const int*)n_dev, (const float*)qk,
+  hipLaunchKernelGGL(gdn_commit_kernel, dim3(NH * DK / VB, L), dim3(VB * NP), 0, s, (const int*)n_dev, (const float*)qk,
                      (const float*)v, (const float*)gb, (float*)state, Tmax);
   hipLaunchKernelGGL(conv_commit_kernel, dim3(NCH / 256, L), dim3(256), 0, s, (const int*)n_dev,
                      (const bf16*)proj, pstride, (size_t)lproj, (bf16*)hist);
