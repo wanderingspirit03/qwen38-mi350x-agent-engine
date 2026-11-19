@@ -47,7 +47,7 @@ EXTRA = int(os.environ.get("ENG_DRAFT_EXTRA", "256"))   # draft-vocabulary slots
 FOLD_NORM = os.environ.get("ENG_FOLD_NORM", "1") == "1"
 # lossy acceptance (see accept_kernel): accept a draft whose target probability is >= tau times the top one
 # (0: exact argmax matches only) and, if ENG_LOSSY_PRICE > 0, whose logit margin is <= price * the tokens it gains
-LOSSY_TAU = float(os.environ.get("ENG_LOSSY_TAU", "0.3"))
+LOSSY_TAU = float(os.environ.get("ENG_LOSSY_TAU", "0.2"))
 LOSSY_PRICE = float(os.environ.get("ENG_LOSSY_PRICE", "0"))
 
 
