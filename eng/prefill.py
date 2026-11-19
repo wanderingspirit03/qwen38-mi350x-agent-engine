@@ -9,7 +9,7 @@ from . import hip as H
 from . import ref_ops as R
 from .kernels.attention import attn_prefill
 from .kernels.attn2 import attn2_prefill, use_attn2
-from .kernels.f8mm import BIG, SMALL, f8mm, interleave
+from .kernels.f8mm import f8mm, interleave
 from .kernels.gdn_prefill import gdn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
@@ -91,7 +91,7 @@ class Lin:
         """xq: rows already quantized into _QBUF, scales in _SBUF. silu: out (M, N/2) = silu(gate) * up."""
         M = xq.shape[0]
         if self.silu:
-            f8mm(xq, _SBUF[:M], self.wq, self.ws, out, BIG if M >= 768 else SMALL, silu=True)
+            f8mm(xq, _SBUF[:M], self.wq, self.ws, out, silu=True)
             return
         if M >= self.tri_min:
             f8mm(xq, _SBUF[:M], self.wq, self.ws, out)
