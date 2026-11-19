@@ -234,6 +234,12 @@ def main():
     if mode == "gdnq":
         check_gdnq()
         check_attnq()
+    if mode == "variants_nt":   # the X_NOMATH / X_NOPRO experiments over configs of 2 and 4 row tiles
+        for pre in ("", "#define X_NOMATH 1\n", "#define X_NOPRO 1\n", "#define X_NOMATH 1\n#define X_NOPRO 1\n"):
+            w4a8._lib = None
+            w4a8._lib = w4a8._build(pre or None)
+            print("variant", pre.strip().replace("\n", " ") or "base", flush=True)
+            bench(names, Ms, [(4, 1), (4, 2), (4, 4), (2, 4), (2, 8)], fused=True, compare=False)
     if mode == "tune":
         bench(names, Ms, CFGS)
     if mode == "bench":
