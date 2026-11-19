@@ -1,15 +1,20 @@
 """Prefill: the target model (and the MTP layer) over a chunk of up to CHUNK positions of one sequence, written into
 the working state (attention KV, GDN states in [layer, head, v, k] layout, conv histories)."""
+import os
+
 import torch
 import torch.nn.functional as F
 
 from . import hip as H
 from . import ref_ops as R
 from .kernels.attention import attn_prefill
+from .kernels.attn2 import attn2_prefill, use_attn2
 from .kernels.gdn_prefill import gdn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
 CHUNK = 8192
+ATTN2 = os.environ.get("ENG_ATTN2", "1") == "1"     # 8-bit prefill attention for long chunks (kernels/attn2.py)
+ATTN2_CFG = dict(QK8=os.environ.get("ENG_ATTN2_QK8", "1") == "1", RECENT=int(os.environ.get("ENG_ATTN2_RECENT", "8")))
 PROJ = CONV_DIM + V_DIM + 96
 
 
@@ -110,7 +115,11 @@ class Prefill:
         lin["qkv"].norm_in(self.x[:T], d, L["in_norm"], self.h[:T], self.qkv[:T])
         H.attn_prep(self.qkv[:T], L["q_norm"], L["k_norm"], self.pos, self.q[:T], st.k[li], st.v[li])
         gate = self.qkv[:T, :HEADS * 512].view(T, HEADS, 512)[..., HEAD_DIM:]
-        attn_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM))
+        if ATTN2 and use_attn2(T, p0):
+            attn2_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM),
+                          **ATTN2_CFG)
+        else:
+            attn_prefill(self.q[:T], st.k[li], st.v[li], p0, gate=gate, out=self.ao[:T].view(T, HEADS, HEAD_DIM))
         lin["o"](self.ao[:T], self.d[:T])
 
     def _mlp(self, L, lin, T):
