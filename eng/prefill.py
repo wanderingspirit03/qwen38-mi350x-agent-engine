@@ -9,6 +9,7 @@ from . import hip as H
 from . import ref_ops as R
 from .kernels.attention import attn_prefill
 from .kernels.attn2 import attn2_prefill, use_attn2
+from .kernels.f8mm import BIG, SMALL, f8mm, interleave
 from .kernels.gdn_prefill import gdn_prefill
 from .model import CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, V_DIM, VOCAB
 
@@ -16,6 +17,7 @@ CHUNK = 8192
 ATTN2 = os.environ.get("ENG_ATTN2", "1") == "1"     # 8-bit prefill attention for long chunks (kernels/attn2.py)
 ATTN2_CFG = dict(QK8=os.environ.get("ENG_ATTN2_QK8", "1") == "1", RECENT=int(os.environ.get("ENG_ATTN2_RECENT", "8")))
 PROJ = CONV_DIM + V_DIM + 96
+F8MM = os.environ.get("ENG_F8MM", "1") == "1"     # Triton fp8 GEMMs (kernels/f8mm.py) for gate_up (+SiLU) and in_proj
 
 
 def gdn_chunk_ref(qk, v, gb, ssmT):
@@ -49,12 +51,19 @@ _SBUF = torch.empty(CHUNK, 1, dtype=torch.float32, device="cuda")
 class Lin:
     """A prefill linear layer: bf16 matmul, or fp8 (per-output-channel weight scales, per-row activation scales)."""
 
-    def __init__(self, w, fp8):
+    def __init__(self, w, fp8, kind=None):
         self.fp8 = fp8
+        # gate_up: rows interleaved for the fused SiLU epilogue (always the Triton GEMM); in_proj: Triton at M >= 1280,
+        # where it beat hipBLASLt in the sweep (notes prefill3.md); everything else: hipBLASLt
+        self.silu = fp8 and F8MM and kind == "gate_up"
+        self.tri_min = 1280 if fp8 and F8MM and kind == "in_proj" else 1 << 30
         if fp8:
             s = w.float().abs().amax(1, keepdim=True).clamp(min=1e-8) / FP8_MAX
             self.wq = (w.float() / s).to(FP8)
             self.ws = s.reshape(1, -1).contiguous()
+            if self.silu:
+                self.wq = interleave(self.wq.view(torch.uint8)).view(FP8)
+                self.ws = interleave(self.ws.reshape(-1, 1)).reshape(1, -1).contiguous()
         else:
             self.w = w
 
@@ -79,7 +88,14 @@ class Lin:
             self(h, out)
 
     def mm_q(self, xq, out):
-        """xq: rows already quantized into _QBUF, scales in _SBUF."""
+        """xq: rows already quantized into _QBUF, scales in _SBUF. silu: out (M, N/2) = silu(gate) * up."""
+        M = xq.shape[0]
+        if self.silu:
+            f8mm(xq, _SBUF[:M], self.wq, self.ws, out, BIG if M >= 768 else SMALL, silu=True)
+            return
+        if M >= self.tri_min:
+            f8mm(xq, _SBUF[:M], self.wq, self.ws, out)
+            return
         torch._scaled_mm(xq, self.wq.t(), scale_a=_SBUF[:xq.shape[0]], scale_b=self.ws, out_dtype=torch.bfloat16,
                          out=out)
 
@@ -90,8 +106,8 @@ class Prefill:
         self.gdn_chunk = gdn_chunk
         self.lin = []
         for L in w.layers:
-            self.lin.append({k: Lin(L[k], fp8) for k in ("qkv", "o", "in_proj", "out", "gate_up", "down") if k in L})
-        self.mlin = {k: Lin(w.mtp[k], fp8) for k in ("fc", "qkv", "o", "gate_up", "down")}
+            self.lin.append({k: Lin(L[k], fp8, k) for k in ("qkv", "o", "in_proj", "out", "gate_up", "down") if k in L})
+        self.mlin = {k: Lin(w.mtp[k], fp8, k) for k in ("fc", "qkv", "o", "gate_up", "down")}
         C = CHUNK
         bf = dict(dtype=torch.bfloat16, device=dev)
         self.x = torch.empty(C, HIDDEN, **bf)
@@ -123,6 +139,12 @@ class Prefill:
         lin["o"](self.ao[:T], self.d[:T])
 
     def _mlp(self, L, lin, T):
+        if lin["gate_up"].silu:
+            lin["gate_up"].norm_in(self.x[:T], self.d[:T], L["post_norm"], self.h[:T], self.act[:T])
+            aq = _QBUF[: T * INTER].view(T, INTER)
+            H.quant_fp8(self.act[:T], aq, _SBUF[:T])
+            lin["down"].mm_q(aq, self.d[:T])
+            return
         lin["gate_up"].norm_in(self.x[:T], self.d[:T], L["post_norm"], self.h[:T], self.gu[:T])
         if lin["down"].fp8:
             aq = _QBUF[: T * INTER].view(T, INTER)
