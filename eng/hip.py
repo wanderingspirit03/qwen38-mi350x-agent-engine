@@ -53,6 +53,18 @@ def gdn_verify_q(qk, v, gb, state, o, proj, gw, xa):
                             p(xa["xg"]), p(xa["xzp"]), xa["xzp"].shape[1], stream()), "gdn_verify_q")
 
 
+lib.gdn_fused.argtypes = [I, P, I, P, P, P, P, P, P, P, P, P, P, P, P, I, P]
+
+
+def gdn_fused(proj, hist, cw, aneg, dtb, state, gw, qk, v, gb, xa):
+    """gdn_prep + gdn_verify_q in one kernel (gdn_fused_kernel): same inputs and outputs (qk / v / gb for the commit,
+    the int8 activation dict xa for the out-projection); no fp32 o scratch."""
+    T = proj.shape[0]
+    assert xa["M"] == T and xa["K"] == 6144 and T <= 16
+    _check(lib.gdn_fused(T, p(proj), proj.stride(0), p(hist), p(cw), p(aneg), p(dtb), p(state), p(gw), p(qk), p(v),
+                         p(gb), p(xa["xq"]), p(xa["xg"]), p(xa["xzp"]), xa["xzp"].shape[1], stream()), "gdn_fused")
+
+
 def gdn_commit(n_dev, qk_all, v_all, gb_all, state_all, proj_all, hist_all):
     """Advance all layers by n_dev[0] rows: qk_all (L, Tmax, 32, 128), v_all (L, Tmax, 48, 128),
     gb_all (L, Tmax, 2, 48), state_all (L, 48, 128, 128), proj_all (L, Tmax, PROJ), hist_all (L, 3, 10240)."""

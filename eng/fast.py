@@ -23,6 +23,7 @@ from .kernels.attention import attn_decode
 from .model import (CONV_DIM, HEAD_DIM, HEADS, HIDDEN, INTER, IS_ATTN, KV_HEADS, N_LAYERS, V_DIM, VOCAB)
 
 PROJ = CONV_DIM + V_DIM + 96
+GDN_FUSED = os.environ.get("ENG_GDN_FUSED", "1") == "1"   # gdn_fused (one kernel per GDN layer) in verify
 
 
 class SeqState:
@@ -296,6 +297,13 @@ class Fast:
             else:
                 proj = self.proj[gi]
                 lin["in_proj"](self.x, proj)
+                if isinstance(lin["out"], A8Linear) and GDN_FUSED:   # one kernel; the output quantized for the GEMM
+                    H.gdn_fused(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], st.ssm[gi], L["gnorm"],
+                                self.qk[gi], self.vv[gi], self.gb[gi], self.goq)
+                    lin["out"](self.goq, self.x, add=True)
+                    gi += 1
+                    self.mlp(lin, R)
+                    continue
                 H.gdn_prep(proj, st.conv[gi], L["conv"], L["A_neg"], L["dt_bias"], self.qk[gi], self.vv[gi],
                            self.gb[gi])
                 if isinstance(lin["out"], A8Linear):     # the gated norm quantizes its output for the GEMM

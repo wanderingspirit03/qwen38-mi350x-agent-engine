@@ -164,6 +164,308 @@ __global__ __launch_bounds__(VB * NP) void gdn_verify_kernel(int T, const float*
   run_steps(T, blockIdx.x, blockIdx.y, qk, v, gb, state, o, nullptr);
 }
 
+typedef float f32x4 __attribute__((ext_vector_type(4)));
+typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
+
+// One kernel per GDN layer and verify: conv + SiLU + L2 norm (gdn_prep), the recurrence over n <= 16 rows in chunked
+// form, and the gated RMSNorm + int8 quantization (gated_norm_q_kernel). The state is only read; writes qk / v / gb
+// as gdn_prep does (gdn_commit reads them).
+// With G_t = exp(g_1 + .. + g_t), a_t = S0 k_t, b_t = S0 q_t, r_t = v_t - G_t a_t:
+//   delta = M r, M = (I + B L)^-1 B, L[t][s] = G_t / G_s (k_s . k_t) for s < t, B = diag(beta);
+//   o = G b + N r, N = Wkq^T M, Wkq[s][t] = G_t / G_s (k_s . q_t) for s <= t.
+// grid 48 (one block per value head), block 512: wave 0 builds M and N (16x16, from the Gram rows) while waves 1..7
+// compute a and b for the 8 tiles of 16 value columns on fp16 MFMA (hi + lo parts: ~fp32 accuracy); then o on MFMA.
+// Rows t >= n are zero. The row order enters only through the mask anc[t] (bit s: row s precedes row t): a chain
+// today; a tree of drafts would use the ancestor sets (and path sums of g).
+#define FW 8
+#define LP (DK + 4)   // padded LDS row (floats)
+__global__ __launch_bounds__(64 * FW) void gdn_fused_kernel(int n, const bf16* __restrict__ proj, int pstride,
+                                                            const bf16* __restrict__ hist, const bf16* __restrict__ cw,
+                                                            const float* __restrict__ aneg, const float* __restrict__ dtb,
+                                                            const float* __restrict__ state, const bf16* __restrict__ gw,
+                                                            float* __restrict__ qk, float* __restrict__ vout,
+                                                            float* __restrict__ gb, signed char* __restrict__ xq,
+                                                            float2* __restrict__ xg, bf16* __restrict__ xzp, int ngp) {
+  typedef _Float16 f16x4 __attribute__((ext_vector_type(4)));
+  const int h = blockIdx.x, tid = threadIdx.x, w = tid / 64, l = tid % 64, kh = h / 3;
+  const int r16 = l % 16, k8 = 8 * (l / 16);
+  __shared__ __attribute__((aligned(16))) float sy[3][16][LP];   // q, k, v rows (after the norm: as in qk / v)
+  __shared__ __attribute__((aligned(16))) _Float16 sh16[4][16][DK + 8];   // q hi, q lo, k hi, k lo
+  __shared__ __attribute__((aligned(16))) float wkk[16][16], wkq[16][16];   // [s][t]
+  __shared__ float smm[16][17], snn[16][17];   // M = (I + B L)^-1 B, N = Wkq^T M
+  __shared__ float sgc[16], sbt[16];
+  // every global load first; rows past n - 1 repeat row n - 1.
+  // state tiles (16 value columns each, MFMA operand layout): wave 1: tiles 0 and 7, wave w >= 2: tile w - 1
+  const int ntile = w == 0 ? 0 : w == 1 ? 2 : 1;
+  float xs[2][DK / 32][8];
+#pragma unroll
+  for (int u = 0; u < 2; u++) {
+    if (u < ntile) {
+      const int tile = u == 1 ? 7 : w == 1 ? 0 : w - 1;
+      const float* srow = state + ((size_t)h * DK + tile * 16 + r16) * DK + k8;
+#pragma unroll
+      for (int j = 0; j < DK / 32; j++) {
+        *(float4*)xs[u][j] = *(const float4*)(srow + 32 * j);
+        *(float4*)(xs[u][j] + 4) = *(const float4*)(srow + 32 * j + 4);
+      }
+    }
+  }
+  // conv items: i = tid + 512 m -> rows 4 qt .. 4 qt + 3 (qt = i / 384) of channel i % 384 (q, k of head kh; v of h)
+  uint32_t xin[3][7];
+  uint2 cwv[3];
+#pragma unroll
+  for (int m = 0; m < 3; m++) {
+    const int i = tid + 512 * m, qt = i / 384, ch = i % 384, part = ch / DK;
+    const int cc = (part == 0 ? kh : part == 1 ? 16 + kh : 32 + h) * DK + ch % DK;
+    cwv[m] = *(const uint2*)(cw + cc * 4);
+#pragma unroll
+    for (int r = 0; r < 7; r++) {
+      const int rr = min(4 * qt + r, n + 2);
+      xin[m][r] = rr < 3 ? *(const unsigned short*)(hist + rr * NCH + cc)
+                         : *(const unsigned short*)(proj + (size_t)(rr - 3) * pstride + cc);
+    }
+  }
+  float ga = 0.f, gbv = 0.f, gan = 0.f, gdt = 0.f;   // g / beta: threads 0..15 -> row tid
+  if (tid < 16) {
+    const int t = min(tid, n - 1);
+    gbv = bf(proj[(size_t)t * pstride + NCH + VD + h]);
+    ga = bf(proj[(size_t)t * pstride + NCH + VD + NH + h]);
+    gan = aneg[h];
+    gdt = dtb[h];
+  }
+  const int nt = tid / 32, ne0 = (tid % 32) * 4;   // norm: row tid / 32, 4 elements
+  const uint2 zv = *(const uint2*)(proj + (size_t)min(nt, n - 1) * pstride + NCH + h * DK + ne0);
+  const uint2 gwv = *(const uint2*)(gw + ne0);
+#pragma unroll
+  for (int m = 0; m < 3; m++) {
+    const int i = tid + 512 * m, qt = i / 384, ch = i % 384, part = ch / DK, ci = ch % DK;
+    const float wc[4] = {__uint_as_float(cwv[m].x << 16), __uint_as_float(cwv[m].x & 0xffff0000u),
+                         __uint_as_float(cwv[m].y << 16), __uint_as_float(cwv[m].y & 0xffff0000u)};
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      const int t = 4 * qt + u;
+      float y = 0.f;
+      if (t < n) {
+        float acc = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc += __uint_as_float(xin[m][u + j] << 16) * wc[j];
+        y = rbf(__fdividef(acc, 1.f + __expf(-acc)));
+      }
+      sy[part][t][ci] = y;
+    }
+  }
+  if (tid < 16) {
+    const int t = tid;
+    float g = 0.f, beta = 0.f;
+    if (t < n) {
+      const float x = ga + gdt;
+      const float sp = x > 20.f ? x : log1pf(expf(x));
+      g = gan * sp;
+      beta = 1.f / (1.f + expf(-gbv));
+      gb[(t * 2 + 0) * NH + h] = g;
+      gb[(t * 2 + 1) * NH + h] = beta;
+    }
+#pragma unroll
+    for (int m = 1; m < 16; m <<= 1) {     // inclusive prefix sum over the chain (a tree: sums along the path)
+      float u = __shfl_up(g, m, 16);
+      if (t >= m) g += u;
+    }
+    sgc[t] = g;
+    sbt[t] = beta;
+  }
+  __syncthreads();
+  // L2 norm of the q and k rows: 32 rows x 16 threads x 8 elements; fp16 hi / lo copies for the MFMAs
+  {
+    const int row = tid / 16, part = row / 16, t = row % 16, e0 = (tid % 16) * 8;
+    float* y = &sy[part][t][e0];
+    float s = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) s += y[e] * y[e];
+#pragma unroll
+    for (int m = 8; m > 0; m >>= 1) s += __shfl_xor(s, m);
+    float r = rsqrtf(s + 1e-6f);
+    if (part == 0) r *= 0.08838834764831845f;
+    f16x8 yh, yl;
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      y[e] *= r;
+      yh[e] = (_Float16)y[e];
+      yl[e] = (_Float16)(y[e] - (float)yh[e]);
+    }
+    *(f16x8*)&sh16[2 * part][t][e0] = yh;
+    *(f16x8*)&sh16[2 * part + 1][t][e0] = yl;
+    if (t < n && h % 3 == 0) {
+      float* dst = qk + (t * 32 + part * 16 + kh) * DK + e0;
+      *(float4*)dst = *(float4*)y;
+      *(float4*)(dst + 4) = *(float4*)(y + 4);
+    }
+    const int tv = tid / 32, ev = (tid % 32) * 4;   // v rows (not normalized) to global
+    if (tv < n) *(float4*)(vout + (tv * NH + h) * DK + ev) = *(float4*)&sy[2][tv][ev];
+  }
+  __syncthreads();
+  f32x4 at[2], bq[2];   // per tile: at[t][c] = k_t . S_c (C layout, rows t), bq[c][t] = S_c . q_t (rows c)
+  if (w == 0) {
+    // wave 0: the Gram rows, their weights, X = (I + B L)^-1 (column j = lane % 16, 16 dependent steps),
+    // M = X B and N = Wkq^T M. Meanwhile waves 1..7 compute the state products.
+    f32x4 gk = {0, 0, 0, 0}, gq = {0, 0, 0, 0};
+#pragma unroll
+    for (int j = 0; j < DK / 32; j++) {
+      const f16x8 qh = *(const f16x8*)&sh16[0][r16][32 * j + k8], ql = *(const f16x8*)&sh16[1][r16][32 * j + k8];
+      const f16x8 kh_ = *(const f16x8*)&sh16[2][r16][32 * j + k8], kl = *(const f16x8*)&sh16[3][r16][32 * j + k8];
+      gk = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, kh_, gk, 0, 0, 0);
+      gk = __builtin_amdgcn_mfma_f32_16x16x32_f16(kl, kh_, gk, 0, 0, 0);
+      gk = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, kl, gk, 0, 0, 0);
+      gq = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, qh, gq, 0, 0, 0);
+      gq = __builtin_amdgcn_mfma_f32_16x16x32_f16(kl, qh, gq, 0, 0, 0);
+      gq = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, ql, gq, 0, 0, 0);
+    }
+    {
+      const int t = r16;
+      const uint32_t anc = (1u << t) - 1u;        // chain (a tree: the ancestor set of t)
+      const float gt = sgc[t], bt = sbt[t];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const int s = 4 * (l / 16) + i;
+        const float e = __expf(gt - sgc[s]);
+        wkk[s][t] = (anc >> s) & 1 ? e * gk[i] * bt : 0.f;
+        wkq[s][t] = ((anc | (1u << t)) >> s) & 1 ? e * gq[i] : 0.f;
+      }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    {
+      const int j = r16;
+      float x[16];
+#pragma unroll
+      for (int t = 0; t < 16; t++) x[t] = t == j ? 1.f : 0.f;
+#pragma unroll
+      for (int s = 0; s < 15; s++) {
+        float wr[16];
+#pragma unroll
+        for (int q = 0; q < 4; q++) *(float4*)(wr + 4 * q) = *(const float4*)&wkk[s][4 * q];
+#pragma unroll
+        for (int t = s + 1; t < 16; t++) x[t] -= wr[t] * x[s];
+      }
+      if (l < 16) {
+        const float bj = sbt[j];
+#pragma unroll
+        for (int t = 0; t < 16; t++) smm[t][j] = x[t] * bj;
+      }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const int t = 4 * e + l / 16, s = r16;
+      float acc = 0.f;
+#pragma unroll
+      for (int u = 0; u < 16; u++) acc += wkq[u][t] * smm[u][s];
+      snn[t][s] = acc;
+    }
+  } else {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      if (u < ntile) {
+        f32x4 a = {0, 0, 0, 0}, b = {0, 0, 0, 0};
+#pragma unroll
+        for (int j = 0; j < DK / 32; j++) {
+          f16x8 shi, slo;
+#pragma unroll
+          for (int i = 0; i < 8; i++) {
+            const _Float16 a16 = (_Float16)xs[u][j][i];
+            shi[i] = a16;
+            slo[i] = (_Float16)(xs[u][j][i] - (float)a16);
+          }
+          const f16x8 qh = *(const f16x8*)&sh16[0][r16][32 * j + k8], ql = *(const f16x8*)&sh16[1][r16][32 * j + k8];
+          const f16x8 kh_ = *(const f16x8*)&sh16[2][r16][32 * j + k8], kl = *(const f16x8*)&sh16[3][r16][32 * j + k8];
+          a = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, shi, a, 0, 0, 0);
+          a = __builtin_amdgcn_mfma_f32_16x16x32_f16(kl, shi, a, 0, 0, 0);
+          a = __builtin_amdgcn_mfma_f32_16x16x32_f16(kh_, slo, a, 0, 0, 0);
+          b = __builtin_amdgcn_mfma_f32_16x16x32_f16(shi, qh, b, 0, 0, 0);
+          b = __builtin_amdgcn_mfma_f32_16x16x32_f16(slo, qh, b, 0, 0, 0);
+          b = __builtin_amdgcn_mfma_f32_16x16x32_f16(shi, ql, b, 0, 0, 0);
+        }
+        at[u] = a;
+        bq[u] = b;
+      }
+    }
+  }
+  __syncthreads();
+  // o = G b + N r, r_t = v_t - G_t a_t: r in the C layout of at (lane: t = 4 (l / 16) + i, c = l % 16) is the A
+  // operand (row c, k = t) of a 16x16x16 MFMA; B operand N^T (k = s, column t'); hi + lo for both
+  if (w > 0) {
+    f16x4 nhi, nlo;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const float nv = snn[r16][4 * (l / 16) + i];
+      nhi[i] = (_Float16)nv;
+      nlo[i] = (_Float16)(nv - (float)nhi[i]);
+    }
+    const float gt = __expf(sgc[r16]);
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      if (u < ntile) {
+        const int c0 = 16 * (u == 1 ? 7 : w == 1 ? 0 : w - 1);
+        f16x4 rhi, rlo;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const int t = 4 * (l / 16) + i;
+          const float rv = sy[2][t][c0 + r16] - __expf(sgc[t]) * at[u][i];
+          rhi[i] = (_Float16)rv;
+          rlo[i] = (_Float16)(rv - (float)rhi[i]);
+        }
+        f32x4 oc = {0, 0, 0, 0};
+        oc = __builtin_amdgcn_mfma_f32_16x16x16f16(rhi, nhi, oc, 0, 0, 0);
+        oc = __builtin_amdgcn_mfma_f32_16x16x16f16(rlo, nhi, oc, 0, 0, 0);
+        oc = __builtin_amdgcn_mfma_f32_16x16x16f16(rhi, nlo, oc, 0, 0, 0);
+#pragma unroll
+        for (int i = 0; i < 4; i++) sy[0][r16][c0 + 4 * (l / 16) + i] = gt * bq[u][i] + oc[i];   // q no longer read
+      }
+    }
+  }
+  __syncthreads();
+  // gated RMSNorm + int8 per (row, head), as gated_norm_q_kernel
+  {
+    const int t = nt, e0 = ne0;
+    const float zf[4] = {__uint_as_float(zv.x << 16), __uint_as_float(zv.x & 0xffff0000u), __uint_as_float(zv.y << 16),
+                         __uint_as_float(zv.y & 0xffff0000u)};
+    const float gwf[4] = {__uint_as_float(gwv.x << 16), __uint_as_float(gwv.x & 0xffff0000u),
+                          __uint_as_float(gwv.y << 16), __uint_as_float(gwv.y & 0xffff0000u)};
+    float x[4], vq[4];
+    float s = 0.f;
+#pragma unroll
+    for (int e = 0; e < 4; e++) { x[e] = rbf(sy[0][t][e0 + e]); s += x[e] * x[e]; }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor(s, m);
+    const float r = rsqrtf(s / 128.f + 1e-6f);
+    float a = 0.f;
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const float z = zf[e];
+      vq[e] = rbf(rbf(rbf(x[e] * r) * gwf[e]) * (z / (1.f + __expf(-z))));
+      a = fmaxf(a, fabsf(vq[e]));
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor(a, m));
+    const float inv = a > 0.f ? 127.f / a : 0.f;
+    int qs = 0, qi[4];
+#pragma unroll
+    for (int e = 0; e < 4; e++) { qi[e] = (int)rintf(vq[e] * inv); qs += qi[e]; }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) qs += __shfl_xor(qs, m);
+    if (t < n) {
+      *(char4*)(xq + (size_t)t * VD + h * DK + e0) = make_char4(qi[0], qi[1], qi[2], qi[3]);
+      if (tid % 32 == 0) {
+        const float sx = a / 127.f;
+        xg[(size_t)t * NH + h] = make_float2(sx / 16.f, 0.f);
+        xzp[(size_t)t * ngp + h] = __float2bfloat16(sx * (float)qs);
+      }
+    }
+  }
+}
+
 // commit: grid (48 * 128 / VB, L). Advances each layer's state by n = *n_dev rows (from the prep outputs).
 __global__ __launch_bounds__(VB * NP) void gdn_commit_kernel(const int* __restrict__ n_dev,
                                                            const float* __restrict__ qk, const float* __restrict__ v,
@@ -356,6 +658,14 @@ int gdn_verify_q(int T, const void* qk, const void* v, const void* gb, const voi
                      (const float*)gb, (const float*)state, (float*)o);
   hipLaunchKernelGGL(gated_norm_q_kernel, dim3(T, NH), dim3(128), 0, s, (const float*)o, (const bf16*)proj, pstride,
                      (const bf16*)gw, (signed char*)xq, (float2*)xg, (bf16*)xzp, ngp);
+  return (int)hipGetLastError();
+}
+int gdn_fused(int T, const void* proj, int pstride, const void* hist, const void* cw, const void* aneg, const void* dtb,
+              const void* state, const void* gw, void* qk, void* v, void* gb, void* xq, void* xg, void* xzp, int ngp,
+              hipStream_t s) {
+  hipLaunchKernelGGL(gdn_fused_kernel, dim3(NH), dim3(64 * FW), 0, s, T, (const bf16*)proj, pstride, (const bf16*)hist,
+                     (const bf16*)cw, (const float*)aneg, (const float*)dtb, (const float*)state, (const bf16*)gw,
+                     (float*)qk, (float*)v, (float*)gb, (signed char*)xq, (float2*)xg, (bf16*)xzp, ngp);
   return (int)hipGetLastError();
 }
 int gdn_commit(int L, int Tmax, const void* n_dev, const void* qk, const void* v, const void* gb, void* state,
