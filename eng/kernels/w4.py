@@ -99,8 +99,9 @@ def rtn_search(wc, clip_search=True):
 
 
 @torch.no_grad()
-def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192):
-    """w: (N, K) CUDA tensor. Returns the packed weight (dict). See the module docstring."""
+def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, rows_per_chunk=8192, H=None):
+    """w: (N, K) CUDA tensor. Returns the packed weight (dict). See the module docstring.
+    H: X^T X of the GEMM's input (x / rms(x) if norm_weight is given): GPTQ (eng.gptq) instead of round-to-nearest."""
     N, K = w.shape
     assert N % 16 == 0 and K % 128 == 0 and group in (64, 128)
     G = group
@@ -112,7 +113,11 @@ def quantize(w, group=128, norm_weight=None, swiglu=False, clip_search=True, row
         wc = w[r0:r0 + rows_per_chunk].float()
         if norm_weight is not None:
             wc = wc * (1 + norm_weight.float())[None]
-        u, s, z = rtn_search(wc.reshape(-1, K // G, G), clip_search)
+        if H is None:
+            u, s, z = rtn_search(wc.reshape(-1, K // G, G), clip_search)
+        else:
+            from ..gptq import gptq_codes
+            u, s, z = gptq_codes(wc, H, G)
         q, m = _pack(u, s, z)
         qs.append(q)
         ms.append(m)

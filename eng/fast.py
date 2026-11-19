@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from . import hip as H
+from .gptq import gptq_codes
 from .kernels import w4 as w4q
 from .kernels import w4a8
 from .kernels.attention import attn_decode
@@ -51,11 +52,25 @@ class Linear:
     (x is then the raw residual stream); swiglu: W is [gate; up] and the output is silu(gate) * up;
     add=True: out += x @ W^T (out is the residual stream)."""
 
-    def __init__(self, w, norm=None, swiglu=False):
+    def __init__(self, w, norm=None, swiglu=False, H=None):
         # folding the norm weight into the 4-bit W roughly doubles its error (local gap 0.0077 vs 0.0033 with
         # ENG_FOLD_NORM=0), but the separate norm kernel costs ~15% decode
+        # H: X^T X of the input (x / rms(x) when the norm is folded) for GPTQ (eng.gptq)
         self.norm = norm if norm is not None and not FOLD_NORM else None
-        self.p = w4q.quantize(w, norm_weight=None if self.norm is not None else norm, swiglu=swiglu)
+        if self.norm is not None:
+            H = None
+        self.p = w4q.quantize(w, norm_weight=None if self.norm is not None else norm, swiglu=swiglu, H=H)
+
+    @staticmethod
+    def from_codes(u, s, z):
+        """A Linear from 4-bit codes, scales and zero points (w4.rtn_search's output layout), no norm."""
+        lin = Linear.__new__(Linear)
+        lin.norm = None
+        qw, meta = w4q._pack(u, s, z)
+        w4q._workspace(qw.device)
+        lin.p = {"qw": qw, "meta": meta, "N": u.shape[0], "K": u.shape[1] * u.shape[2], "G": u.shape[2],
+                 "rms": False, "swiglu": False}
+        return lin
 
     def __call__(self, x, out, add=False):
         if self.norm is not None:
@@ -139,7 +154,8 @@ def attn_decode_ref(q, kc, vc, pos_dev, R):
 
 
 class Fast:
-    def __init__(self, w, K, dev="cuda"):
+    def __init__(self, w, K, dev="cuda", hess=None):
+        """hess: eng.gptq.mtp_hessians(...) for GPTQ of the MTP layer and the draft head (None: round-to-nearest)"""
         self.w, self.K, self.R = w, K, K + 1
         R = self.R
         bf = dict(dtype=torch.bfloat16, device=dev)
@@ -148,8 +164,9 @@ class Fast:
             self.lin.append(self._layer_lin(L, IS_ATTN[i], A8Linear if W4A8 != "0" else Linear))
         M = w.mtp
         ML = A8Linear if W4A8 == "mtp" else Linear
-        self.mlin = self._layer_lin(M, True, ML)
-        self.mlin["fc"] = ML(M["fc"])
+        hk = {"H": hess} if hess is not None and ML is Linear else {}
+        self.mlin = self._layer_lin(M, True, ML, **hk)
+        self.mlin["fc"] = ML(M["fc"], H=hess["fc"]) if hk else ML(M["fc"])
         HL = {4: Linear, 8: W8Linear, 16: Bf16Linear}[HEAD_BITS]
         self.head = HL(w.lm_head)
         # drafts are chosen from the 32768 most frequent output tokens (eng/draft_vocab.npy): an 8x smaller head,
@@ -160,14 +177,21 @@ class Fast:
         self.in_dv[dv] = True
         dv = np.concatenate([dv, np.full(EXTRA, dv[0])])
         self.dvocab = torch.from_numpy(dv.astype(np.int64)).to(dev)
-        self.dhead = Linear(w.lm_head[self.dvocab].contiguous())
         if EXTRA:   # every lm_head row's 4-bit codes, scales and zero points (as quantize() makes them), for set_extra
             self.hu = torch.empty(VOCAB, HIDDEN // 128, 128, dtype=torch.uint8, device=dev)
             self.hs = torch.empty(VOCAB, HIDDEN // 128, dtype=torch.float16, device=dev)
             self.hz = torch.empty(VOCAB, HIDDEN // 128, dtype=torch.uint8, device=dev)
             for r0 in range(0, VOCAB, 8192):
-                u, s, z = w4q.rtn_search(w.lm_head[r0:r0 + 8192].float().reshape(-1, HIDDEN // 128, 128))
+                wc = w.lm_head[r0:r0 + 8192].float()
+                if hess is None:
+                    u, s, z = w4q.rtn_search(wc.reshape(-1, HIDDEN // 128, 128))
+                else:
+                    u, s, z = gptq_codes(wc, hess["head"])
                 self.hu[r0:r0 + 8192], self.hs[r0:r0 + 8192], self.hz[r0:r0 + 8192] = u, s, z
+            t = self.dvocab
+            self.dhead = Linear.from_codes(self.hu[t].int(), self.hs[t].float(), self.hz[t].float())
+        else:
+            self.dhead = Linear(w.lm_head[self.dvocab].contiguous(), H=None if hess is None else hess["head"])
         # GDN per-layer weights stacked for the all-layer commit
         G = [L for i, L in enumerate(w.layers) if not IS_ATTN[i]]
         self.cw = torch.stack([L["conv"] for L in G])
@@ -223,7 +247,11 @@ class Fast:
 
     # ---- the target model on R rows ----
     @staticmethod
-    def _layer_lin(L, attn, Lin=Linear):
+    def _layer_lin(L, attn, Lin=Linear, H=None):
+        if H is not None:       # GPTQ (the MTP layer)
+            return {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True, H=H["gate_up"]),
+                    "down": Lin(L["down"], H=H["down"]), "qkv": Lin(L["qkv"], L["in_norm"], H=H["qkv"]),
+                    "o": Lin(L["o"], H=H["o"])}
         d = {"gate_up": Lin(L["gate_up"], L["post_norm"], swiglu=True), "down": Lin(L["down"])}
         if attn:
             d["qkv"], d["o"] = Lin(L["qkv"], L["in_norm"]), Lin(L["o"])
