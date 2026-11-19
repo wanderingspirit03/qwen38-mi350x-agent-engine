@@ -244,14 +244,16 @@ __global__ __launch_bounds__(128) void gated_norm_q_kernel(const float* __restri
 }
 
 // prefill: y (T, 10240) bf16 = silu(conv) of q|k|v (raw, not normalized); gb (T, 2, 48) = g, beta.
-// grid (ceil(T / 16), 81), block 128: each thread runs one channel over 16 positions with a sliding window.
+// grid (ceil(T / CT), 11), block 128: blockIdx.y < 10: each thread runs 8 consecutive channels over CT positions
+// (all CT + 3 input rows loaded first, 16-byte loads and stores); blockIdx.y == 10: g and beta.
+#define CT 16
 __global__ __launch_bounds__(128) void gdn_conv_kernel(const bf16* __restrict__ proj, int pstride,
                                                        const bf16* __restrict__ hist, const bf16* __restrict__ cw,
                                                        const float* __restrict__ aneg, const float* __restrict__ dtb,
                                                        bf16* __restrict__ y, float* __restrict__ gb, int T) {
-  int t0 = blockIdx.x * 16, grp = blockIdx.y, i = threadIdx.x;
-  int t1 = min(T, t0 + 16);
-  if (grp == 80) {
+  const int t0 = blockIdx.x * CT, i = threadIdx.x;
+  const int t1 = min(T, t0 + CT);
+  if (blockIdx.y == 10) {
     for (int k = i; k < (t1 - t0) * NH; k += 128) {
       int t = t0 + k / NH, h = k % NH;
       float b = bf(proj[(size_t)t * pstride + NCH + VD + h]);
@@ -263,26 +265,59 @@ __global__ __launch_bounds__(128) void gdn_conv_kernel(const bf16* __restrict__ 
     }
     return;
   }
-  int c = grp * 128 + i;
-  float w0 = bf(cw[c * 4]), w1 = bf(cw[c * 4 + 1]), w2 = bf(cw[c * 4 + 2]), w3 = bf(cw[c * 4 + 3]);
-  auto in = [&](int r) { return r < 3 ? bf(hist[r * NCH + c]) : bf(proj[(size_t)(r - 3) * pstride + c]); };
-  float x0 = in(t0), x1 = in(t0 + 1), x2 = in(t0 + 2);
-  for (int t = t0; t < t1; t++) {
-    float x3 = in(t + 3);
-    float acc = 0.f;
-    acc += x0 * w0;
-    acc += x1 * w1;
-    acc += x2 * w2;
-    acc += x3 * w3;
-    y[(size_t)t * NCH + c] = __float2bfloat16(acc / (1.f + expf(-acc)));
-    x0 = x1; x1 = x2; x2 = x3;
+  const int c = blockIdx.y * 1024 + i * 8;
+  uint4 in[CT + 3];
+#pragma unroll
+  for (int r = 0; r < CT + 3; r++) {
+    const int t = t0 + r - 3;   // input row r is position t0 + r - 3 (history rows for t < 0)
+    if (t < t1) in[r] = t < 0 ? *(const uint4*)(hist + (t + 3) * NCH + c) : *(const uint4*)(proj + (size_t)t * pstride + c);
+  }
+  float w[8][4];
+  {
+    const uint4* wp = (const uint4*)(cw + (size_t)c * 4);   // 8 channels x 4 taps = 64 bytes
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint4 u = wp[j];
+      const uint32_t uu[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        w[2 * j + e / 2][2 * (e & 1)] = __uint_as_float(uu[e] << 16);
+        w[2 * j + e / 2][2 * (e & 1) + 1] = __uint_as_float(uu[e] & 0xffff0000u);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < CT; r++) {
+    const int t = t0 + r;
+    if (t >= t1) break;
+    uint32_t o[4];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+      float res[2];
+#pragma unroll
+      for (int s = 0; s < 2; s++) {
+        const int e = 2 * p + s;
+        float acc = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const uint4& u = in[r + j];
+          const uint32_t v = p == 0 ? u.x : p == 1 ? u.y : p == 2 ? u.z : u.w;
+          const float x = s == 0 ? __uint_as_float(v << 16) : __uint_as_float(v & 0xffff0000u);
+          acc += x * w[e][j];
+        }
+        res[s] = __fdividef(acc, 1.f + __expf(-acc));
+      }
+      o[p] = (uint32_t)__bfloat16_as_ushort(__float2bfloat16(res[0])) |
+             ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(res[1])) << 16);
+    }
+    *(uint4*)(y + (size_t)t * NCH + c) = make_uint4(o[0], o[1], o[2], o[3]);
   }
 }
 
 extern "C" {
 int gdn_conv(int T, const void* proj, int pstride, const void* hist, const void* cw, const void* aneg,
              const void* dtb, void* y, void* gb, hipStream_t s) {
-  hipLaunchKernelGGL(gdn_conv_kernel, dim3((T + 15) / 16, 81), dim3(128), 0, s, (const bf16*)proj, pstride,
+  hipLaunchKernelGGL(gdn_conv_kernel, dim3((T + CT - 1) / CT, 11), dim3(128), 0, s, (const bf16*)proj, pstride,
                      (const bf16*)hist, (const bf16*)cw, (const float*)aneg, (const float*)dtb, (bf16*)y, (float*)gb, T);
   return (int)hipGetLastError();
 }

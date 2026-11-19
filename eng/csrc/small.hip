@@ -75,39 +75,73 @@ __global__ __launch_bounds__(256) void add_rmsnorm_kernel(bf16* __restrict__ x, 
 }
 
 // qkv (R, 14336) rows: per query head [q 256 | gate 256] x 24, then k (4 x 256), v (4 x 256).
-// grid (R, 32), block 256: y < 24 query heads -> qout (R, 24, 256); 24..27 k heads -> kc[pos+r]; 28..31 v -> vc.
-// q and k: RMSNorm over the head (1 + w), then rotary embedding on dims 0..63 (rotate-half pairs (i, i+32)).
+// grid (R, 8 / HPW), block 256: wave wv of block y handles heads wv + 4 (y HPW + j), j < HPW, 4 consecutive dims
+// per lane (HPW = 8 for long prefill chunks, 1 for few rows). Heads < 24 are
+// query heads -> qout (R, 24, 256); 24..27 k heads -> kc[pos+r]; 28..31 v -> vc.
+// q and k: RMSNorm over the head (1 + w), then rotary embedding on dims 0..63 (rotate-half pairs (i, i+32): the
+// partner dims sit in lane ^ 8). cos/sin of the row's 32 angles are computed once per row.
+template <int HPW>
 __global__ __launch_bounds__(256) void attn_prep_kernel(const bf16* __restrict__ qkv, const bf16* __restrict__ qw,
                                                         const bf16* __restrict__ kw, const int* __restrict__ pos0,
                                                         bf16* __restrict__ qout, bf16* __restrict__ kc,
                                                         bf16* __restrict__ vc) {
-  __shared__ float red[4];
-  __shared__ float xs[256];
-  int r = blockIdx.x, hd = blockIdx.y, i = threadIdx.x;
-  int pos = *pos0 + r;
+  __shared__ float cs[2][32];
+  const int r = blockIdx.x, l = threadIdx.x & 63, wv = threadIdx.x >> 6;
+  const int pos = *pos0 + r;
   const bf16* row = qkv + (size_t)r * 14336;
-  if (hd >= 28) {
-    int kvh = hd - 28;
-    vc[((size_t)pos * 4 + kvh) * 256 + i] = row[12288 + 1024 + kvh * 256 + i];
-    return;
+  const int hd0 = wv + 4 * HPW * blockIdx.y;
+  uint2 u[HPW];
+#pragma unroll
+  for (int j = 0; j < HPW; j++) {
+    const int hd = hd0 + 4 * j;
+    u[j] = *(const uint2*)(row + (hd < 24 ? hd * 512 : 12288 + (hd - 24) * 256) + 4 * l);
   }
-  bool isq = hd < 24;
-  float x = isq ? bf(row[hd * 512 + i]) : bf(row[12288 + (hd - 24) * 256 + i]);
-  float tot = block_sum<256>(x * x, red);
-  float y = rbf(x * rsqrtf(tot / 256.f + 1e-6f) * (1.f + bf(isq ? qw[i] : kw[i])));
-  xs[i] = y;
+  const uint2 qwu = *(const uint2*)(qw + 4 * l), kwu = *(const uint2*)(kw + 4 * l);
+  if (threadIdx.x < 32) {
+    const int f = threadIdx.x;
+    const float inv = powf(10000000.f, -(float)(2 * f) / 64.f);
+    const float ang = (float)pos * inv;
+    cs[0][f] = cosf(ang);
+    cs[1][f] = sinf(ang);
+  }
   __syncthreads();
-  if (i < 64) {
-    int f = i & 31;
-    float inv = powf(10000000.f, -(float)(2 * f) / 64.f);
-    float ang = (float)pos * inv;
-    float c = cosf(ang), s = sinf(ang);
-    float other = xs[i < 32 ? i + 32 : i - 32];
-    y = i < 32 ? y * c - other * s : y * c + other * s;
+  float c[4], sn[4];
+#pragma unroll
+  for (int e = 0; e < 4; e++) {
+    c[e] = cs[0][(4 * l + e) & 31];
+    sn[e] = cs[1][(4 * l + e) & 31];
   }
-  bf16 o = __float2bfloat16(y);
-  if (isq) qout[((size_t)r * 24 + hd) * 256 + i] = o;
-  else kc[((size_t)pos * 4 + (hd - 24)) * 256 + i] = o;
+#pragma unroll
+  for (int j = 0; j < HPW; j++) {
+    const int hd = hd0 + 4 * j;
+    if (hd >= 28) {
+      *(uint2*)(vc + ((size_t)pos * 4 + hd - 28) * 256 + 4 * l) = u[j];
+      continue;
+    }
+    const bool isq = hd < 24;
+    const uint2 wu = isq ? qwu : kwu;
+    float x[4] = {__uint_as_float(u[j].x << 16), __uint_as_float(u[j].x & 0xffff0000u), __uint_as_float(u[j].y << 16),
+                  __uint_as_float(u[j].y & 0xffff0000u)};
+    const float wf[4] = {__uint_as_float(wu.x << 16), __uint_as_float(wu.x & 0xffff0000u), __uint_as_float(wu.y << 16),
+                         __uint_as_float(wu.y & 0xffff0000u)};
+    float s = x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3];
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) s += __shfl_xor(s, o);
+    const float rs = rsqrtf(s / 256.f + 1e-6f);
+#pragma unroll
+    for (int e = 0; e < 4; e++) x[e] = rbf(x[e] * rs * (1.f + wf[e]));
+    float y[4];
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const float other = __shfl_xor(x[e], 8);
+      y[e] = l >= 16 ? x[e] : l < 8 ? x[e] * c[e] - other * sn[e] : x[e] * c[e] + other * sn[e];
+    }
+    uint2 o;
+    o.x = (uint32_t)__bfloat16_as_ushort(__float2bfloat16(y[0])) | ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(y[1])) << 16);
+    o.y = (uint32_t)__bfloat16_as_ushort(__float2bfloat16(y[2])) | ((uint32_t)__bfloat16_as_ushort(__float2bfloat16(y[3])) << 16);
+    if (isq) *(uint2*)(qout + ((size_t)r * 24 + hd) * 256 + 4 * l) = o;
+    else *(uint2*)(kc + ((size_t)pos * 4 + (hd - 24)) * 256 + 4 * l) = o;
+  }
 }
 
 // act (R, I) = silu(gu[:, :I]) * gu[:, I:]
@@ -460,7 +494,9 @@ int add_rmsnorm(int R, int H, void* x, const void* d, const void* w, void* out, 
 }
 int attn_prep(int R, const void* qkv, const void* qw, const void* kw, const void* pos0, void* qout, void* kc,
               void* vc, hipStream_t s) {
-  hipLaunchKernelGGL(attn_prep_kernel, dim3(R, 32), dim3(256), 0, s, (const bf16*)qkv, (const bf16*)qw,
+  if (R <= 128) hipLaunchKernelGGL(attn_prep_kernel<1>, dim3(R, 8), dim3(256), 0, s, (const bf16*)qkv, (const bf16*)qw,
+                                  (const bf16*)kw, (const int*)pos0, (bf16*)qout, (bf16*)kc, (bf16*)vc);
+  else hipLaunchKernelGGL(attn_prep_kernel<8>, dim3(R), dim3(256), 0, s, (const bf16*)qkv, (const bf16*)qw,
                      (const bf16*)kw, (const int*)pos0, (bf16*)qout, (bf16*)kc, (bf16*)vc);
   return (int)hipGetLastError();
 }
