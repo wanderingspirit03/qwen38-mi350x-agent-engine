@@ -152,7 +152,54 @@ def kernel_times(T):
     print(f"T={T} kernels (us):", "  ".join(f"{k} {v:.1f}" for k, v in ev), f"  sum {sum(v for _, v in ev):.1f}")
 
 
+def wy_compare(Ts=(1, 37, 64, 1000, 5600)):
+    """HIP gdn_wy vs the Triton _wy_kernel: the same outputs, errors relative to max |ref|; timings."""
+    import triton
+    from eng.kernels import gdn_prefill as GP
+    for T in Ts:
+        q, k, v, g, beta, _ = make_inputs(T, seed=T)
+        NC = triton.cdiv(T, 64)
+        NC += NC % 2
+        Tp = NC * 64
+        bf = torch.bfloat16
+        outs = []
+        for hip in (False, True):
+            o = dict(w=torch.zeros(Tp, HV, D, device="cuda", dtype=bf), uT=torch.zeros(NC, HV, D, 64, device="cuda", dtype=bf),
+                     kdT=torch.zeros(NC, HV, D, 64, device="cuda", dtype=bf), G=torch.zeros(HV, Tp, device="cuda"),
+                     qn=torch.zeros(Tp, HK, D, device="cuda", dtype=bf), M=torch.zeros(NC, HV, 64, 64, device="cuda", dtype=bf))
+            f = lambda: GP.wy(q, k, v, g, beta, o["w"], o["uT"], o["kdT"], o["G"], o["qn"], o["M"], T, Tp, NC, hip=hip)
+            f()
+            outs.append((o, timeit(f) * 1e3))
+        (a, ta), (b, tb) = outs
+        errs = " ".join(f"{n} {((b[n].float() - a[n].float()).abs().max() / a[n].float().abs().max().clamp(min=1e-30)).item():.1e}"
+                        for n in a)
+        print(f"wy T={T:5d}: triton {ta:.1f} us, hip {tb:.1f} us; rel max err {errs}", flush=True)
+
+
+def ckpt_check(T=4133, every=1024):
+    """States stored by ckpt equal the final states of calls on the prefixes."""
+    q, k, v, g, beta, S0 = make_inputs(T, seed=5)
+    n = T // every
+    ck = torch.full((n, *S0.shape), float("nan"), device="cuda")
+    S = S0.clone()
+    o = gdn_prefill(q, k, v, g, beta, S, ckpt=(every, ck))
+    S_plain = S0.clone()
+    o_plain = gdn_prefill(q, k, v, g, beta, S_plain)
+    assert torch.equal(o, o_plain) and torch.equal(S, S_plain)
+    for i in range(n):
+        m = (i + 1) * every
+        Si = S0.clone()
+        gdn_prefill(q[:m], k[:m], v[:m], g[:m], beta[:m], Si)
+        print(f"ckpt {i} (after {m} tokens): max abs diff {(ck[i] - Si).abs().max().item():.2e}")
+
+
 if __name__ == "__main__":
+    if "--ckpt" in sys.argv:
+        ckpt_check()
+        sys.exit()
+    if "--wy" in sys.argv:
+        wy_compare()
+        sys.exit()
     if "--quick" not in sys.argv:
         check()
         check_proj()
