@@ -414,14 +414,43 @@ __global__ __launch_bounds__(256) void mtp_in_kernel(long long* __restrict__ tok
 // new[i] = d_{i+1} for i < a, else y_a; res = [n, new...]; vt[0] = y_a; pick = a.
 // pos (position of x) advances by n. P (int32): [0] old pos (catch-up), [1] old pos + R (catch-up keys),
 // [2] new pos + R (next verify keys), [3 + 2j] new pos + j, [4 + 2j] new pos + j + 1 (chain step j = 0..K-2).
+// Lossy acceptance (lp = {price, cap, margin sum, count}, price > 0): a draft d_i that is not the argmax of row i
+// is still accepted when its margin m = logit(argmax) - logit(d_i) <= min(cap, price * gain), gain = the tokens
+// the round gains by it: 1 + the exact matches that follow it. (price huge: the plain rule p(d)/p(top) >= e^-cap.)
+// The bonus token is always the argmax. The margins of the lossy tokens are summed into lp[2], their count lp[3].
 __global__ void accept_kernel(int R, long long* __restrict__ vt, const long long* __restrict__ y,
                               int* __restrict__ n_acc, long long* __restrict__ nw, long long* __restrict__ res,
-                              long long* __restrict__ pick, int* __restrict__ pos, int* __restrict__ P) {
+                              long long* __restrict__ pick, int* __restrict__ pos, int* __restrict__ P,
+                              const bf16* __restrict__ logits, int V, float* __restrict__ lp) {
   __shared__ int sa;
+  __shared__ float sm[64];
   int i = threadIdx.x, K = R - 1;
   bool mis = i < K && vt[1 + i] != y[i];
+  const float price = lp[0];
+  if (mis && price > 0.f) {
+    const bf16* l = logits + (size_t)i * V;
+    sm[i] = (float)l[y[i]] - (float)l[vt[1 + i]];
+  }
   unsigned long long b = __ballot(mis);
-  if (i == 0) sa = b ? __ffsll((long long)b) - 1 : K;
+  __syncthreads();
+  if (i == 0) {
+    int a = b ? __ffsll((long long)b) - 1 : K;
+    if (price > 0.f) {
+      const float cap = lp[1];
+      float msum = 0.f, cnt = 0.f;
+      while (a < K) {
+        const unsigned long long rest = b >> (a + 1);
+        const int gain = 1 + (rest ? __ffsll((long long)rest) - 1 : K - 1 - a);
+        if (sm[a] > fminf(cap, price * gain)) break;
+        msum += sm[a];
+        cnt += 1.f;
+        a += gain;
+      }
+      lp[2] += msum;
+      lp[3] += cnt;
+    }
+    sa = a;
+  }
   __syncthreads();
   int a = sa;
   long long ya = y[a];
@@ -446,9 +475,10 @@ __global__ void accept_kernel(int R, long long* __restrict__ vt, const long long
 
 extern "C" {
 int accept(int R, void* vt, const void* y, void* n_acc, void* nw, void* res, void* pick, void* pos, void* P,
-           hipStream_t s) {
+           const void* logits, int V, const void* thr, hipStream_t s) {
   hipLaunchKernelGGL(accept_kernel, dim3(1), dim3(64), 0, s, R, (long long*)vt, (const long long*)y, (int*)n_acc,
-                     (long long*)nw, (long long*)res, (long long*)pick, (int*)pos, (int*)P);
+                     (long long*)nw, (long long*)res, (long long*)pick, (int*)pos, (int*)P, (const bf16*)logits, V,
+                     (float*)thr);
   return (int)hipGetLastError();
 }
 int mtp_in(int R, int H, void* tok, const void* embed, const void* hid, int hs, const void* we, const void* wh,
