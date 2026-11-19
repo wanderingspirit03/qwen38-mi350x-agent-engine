@@ -145,7 +145,7 @@ class _Hook:
     on = True
 
     def __init__(self, lin, H, name):
-        self.lin, self.H, self.name, self.fp8 = lin, H, name, False
+        self.lin, self.H, self.name, self.fp8, self.silu = lin, H, name, False, False
 
     def __call__(self, x, out):
         if _Hook.on:
