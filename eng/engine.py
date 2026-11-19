@@ -17,9 +17,20 @@ MAX_LEN = int(os.environ.get("ENG_MAX_LEN", "24576"))
 CACHE_GB = float(os.environ.get("ENG_CACHE_GB", "80"))
 
 
+def merge_mtp_delta(mtp, path):
+    """the self-distilled MTP draft (eng.mtp_train): LoRA factors and norm-vector deltas merged into its weights"""
+    d = torch.load(path)
+    for k, A in d["A"].items():
+        mtp[k] = (mtp[k].float() + d["B"][k].cuda().float() @ A.cuda().float()).bfloat16()
+    for k, dn in d["dn"].items():
+        mtp[k] = (mtp[k].float() + dn.cuda()).bfloat16()
+
+
 class Engine:
     def __init__(self, path):
         self.w = Weights(path)
+        if os.environ.get("ENG_MTP_DELTA", "1") == "1":
+            merge_mtp_delta(self.w.mtp, os.path.join(os.path.dirname(__file__), "mtp_delta.pt"))
         self.st = SeqState(MAX_LEN)
         self.kv = torch.stack([self.st.k, self.st.v])      # (2, 17, MAX_LEN, 4, 256), the working KV
         self.st.k, self.st.v = self.kv[0], self.kv[1]
